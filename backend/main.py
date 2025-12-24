@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import pandas as pd
 import os
 import math
+import re
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -187,13 +188,17 @@ def select_comparables(
         axis=1
     )
     
-    # Try radius 800m first, expand to 2000m if needed
-    radius_m = 800.0
-    comps_in_radius = comps_filtered[comps_filtered["distance_m"] <= radius_m]
+    # Adaptive radius expansion: 500m -> 800m -> 1200m -> 2000m
+    # Stop as soon as we have >= 12 comps
+    radius_options = [500.0, 800.0, 1200.0, 2000.0]
+    radius_m = 0.0
+    comps_in_radius = pd.DataFrame()
     
-    if len(comps_in_radius) < min_comps:
-        radius_m = 2000.0
-        comps_in_radius = comps_filtered[comps_filtered["distance_m"] <= radius_m]
+    for radius in radius_options:
+        radius_m = radius
+        comps_in_radius = comps_filtered[comps_filtered["distance_m"] <= radius_m].copy()
+        if len(comps_in_radius) >= 12:
+            break
     
     if len(comps_in_radius) < min_comps:
         return pd.DataFrame(), radius_m
@@ -226,21 +231,22 @@ def compute_comps_estimate(comps_df: pd.DataFrame) -> Tuple[float, List[float]]:
     )
     comps_df["weight"] = 1.0 / (1.0 + comps_df["time_on_market_days"] / 14.0)
     
-    prices = comps_df["price_pcm"].values
+    prices_series = comps_df["price_pcm"]
     weights = comps_df["weight"].values
     
-    # Unweighted median
-    unweighted_median = float(prices.median())
+    # Unweighted median (use pandas Series median)
+    unweighted_median = float(prices_series.median())
     
     # Weighted mean
-    weighted_mean = float((prices * weights).sum() / weights.sum())
+    prices_array = prices_series.values
+    weighted_mean = float((prices_array * weights).sum() / weights.sum())
     
     # Expected median = average of unweighted median and weighted mean
     expected_median = (unweighted_median + weighted_mean) / 2.0
     
-    # Robust range using percentiles (25/75)
-    expected_lower = float(prices.quantile(0.25))
-    expected_upper = float(prices.quantile(0.75))
+    # Robust range using percentiles (25/75) - use pandas Series quantile
+    expected_lower = float(prices_series.quantile(0.25))
+    expected_upper = float(prices_series.quantile(0.75))
     
     return expected_median, [expected_lower, expected_upper]
 
@@ -314,6 +320,11 @@ class EvaluateResponse(BaseModel):
     comps_radius_m: float
     comps_expected_median_pcm: float
     comps_expected_range_pcm: List[float]
+    deviation_pct_damped: float
+    confidence_adjusted: bool
+    adaptive_radius_used: bool
+    strong_similarity: bool
+    similarity_dampening_factor: float
 
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate_property(request: EvaluateRequest):
@@ -353,12 +364,30 @@ async def evaluate_property(request: EvaluateRequest):
             comps_sample_size=0,
             comps_radius_m=0.0,
             comps_expected_median_pcm=0.0,
-            comps_expected_range_pcm=[0.0, 0.0]
+            comps_expected_range_pcm=[0.0, 0.0],
+            deviation_pct_damped=0.0,
+            confidence_adjusted=False,
+            adaptive_radius_used=False,
+            strong_similarity=False,
+            similarity_dampening_factor=0.0
         )
     
     lat = postcode_row.iloc[0]["lat"]
     lon = postcode_row.iloc[0]["lon"]
     ladcd = postcode_row.iloc[0]["ladcd"]
+    
+    # Extract postcode district for prime central London check
+    postcode_district = ""
+    if " " in request.postcode:
+        postcode_district = request.postcode.split()[0].upper()
+    else:
+        # Try to extract district from postcode (first 2-4 chars)
+        postcode_clean = request.postcode.replace(" ", "").upper()
+        if len(postcode_clean) >= 2:
+            # Match pattern like SW1A, W1, EC1, etc.
+            match = re.match(r'([A-Z]{1,2}\d[A-Z]?)', postcode_clean)
+            if match:
+                postcode_district = match.group(1)
     
     # Step 2: lat/lon -> nearest borough by matching postcode's borough column if present
     # Using ladcd to match with ons_clean, with fallback to area name matching
@@ -407,7 +436,12 @@ async def evaluate_property(request: EvaluateRequest):
             comps_sample_size=0,
             comps_radius_m=0.0,
             comps_expected_median_pcm=0.0,
-            comps_expected_range_pcm=[0.0, 0.0]
+            comps_expected_range_pcm=[0.0, 0.0],
+            deviation_pct_damped=0.0,
+            confidence_adjusted=False,
+            adaptive_radius_used=False,
+            strong_similarity=False,
+            similarity_dampening_factor=0.0
         )
     
     median_rent = ons_row.iloc[0]["median_rent"]
@@ -441,7 +475,12 @@ async def evaluate_property(request: EvaluateRequest):
             comps_sample_size=0,
             comps_radius_m=0.0,
             comps_expected_median_pcm=0.0,
-            comps_expected_range_pcm=[0.0, 0.0]
+            comps_expected_range_pcm=[0.0, 0.0],
+            deviation_pct_damped=0.0,
+            confidence_adjusted=False,
+            adaptive_radius_used=False,
+            strong_similarity=False,
+            similarity_dampening_factor=0.0
         )
     
     # Step 4: Get bedroom multiplier
@@ -476,28 +515,76 @@ async def evaluate_property(request: EvaluateRequest):
     comps_radius_m = 0.0
     comps_expected_median = 0.0
     comps_expected_range = [0.0, 0.0]
+    adaptive_radius_used = False
+    strong_similarity = False
+    similarity_dampening_factor = 0.0
     
     if comps_data is not None and len(comps_data) > 0:
         comps_selected, comps_radius_m = select_comparables(
             lat, lon, request.bedrooms, request.property_type, comps_data
         )
         
+        # Check if adaptive radius was used (radius > 500m)
+        adaptive_radius_used = comps_radius_m > 500.0
+        
         if len(comps_selected) >= 8:
             comps_expected_median, comps_expected_range = compute_comps_estimate(comps_selected)
             comps_used = True
             comps_sample_size = len(comps_selected)
+            
+            # Compute similarity strength score
+            exact_bedroom_matches = (comps_selected["bedrooms"] == request.bedrooms).sum()
+            exact_bedroom_match_pct = exact_bedroom_matches / len(comps_selected) if len(comps_selected) > 0 else 0.0
+            close_radius = comps_radius_m <= 1200.0
+            sufficient_comps = comps_sample_size >= 10
+            
+            strong_similarity = (
+                exact_bedroom_match_pct >= 0.6
+                and close_radius
+                and sufficient_comps
+            )
+        else:
+            strong_similarity = False
+    else:
+        strong_similarity = False
     
-    # Step 6.6: Blend comps with ONS baseline
-    if comps_used:
-        # Blend: 70% comps, 30% ONS
-        expected_median_base = 0.7 * comps_expected_median + 0.3 * expected_median_ons
-        expected_lower_base = 0.7 * comps_expected_range[0] + 0.3 * expected_lower_ons
-        expected_upper_base = 0.7 * comps_expected_range[1] + 0.3 * expected_upper_ons
+    # Step 6.6: Blend comps with ONS baseline (with prime central London and divergence safeguards)
+    prime_central_districts = {"SW1A", "SW1", "SW1X", "W1", "W1J", "W1K", "W1S", "WC2", "EC1", "EC2", "EC3", "EC4"}
+    is_prime_central = postcode_district in prime_central_districts
+    
+    # Structural divergence safeguard
+    structural_divergence = False
+    if comps_used and expected_median_ons > 0:
+        ratio_comps_to_ons = comps_expected_median / expected_median_ons
+        ratio_ons_to_comps = expected_median_ons / comps_expected_median
+        if ratio_comps_to_ons > 2.5 or ratio_ons_to_comps > 2.5:
+            structural_divergence = True
+    
+    # Determine blending weights
+    if structural_divergence:
+        # Ignore ONS entirely
+        ons_weight = 0.0
+        comps_weight = 1.0
+    elif is_prime_central and comps_used:
+        # Prime central: reduce ONS weight to max 15%
+        if comps_sample_size >= 15:
+            ons_weight = 0.0
+        else:
+            ons_weight = 0.15
+        comps_weight = 1.0 - ons_weight
+    elif comps_used:
+        # Standard blend: 70% comps, 30% ONS
+        comps_weight = 0.7
+        ons_weight = 0.3
     else:
         # Fall back to ONS only
-        expected_median_base = expected_median_ons
-        expected_lower_base = expected_lower_ons
-        expected_upper_base = expected_upper_ons
+        comps_weight = 0.0
+        ons_weight = 1.0
+    
+    # Blend
+    expected_median_base = comps_weight * comps_expected_median + ons_weight * expected_median_ons
+    expected_lower_base = comps_weight * comps_expected_range[0] + ons_weight * expected_lower_ons
+    expected_upper_base = comps_weight * comps_expected_range[1] + ons_weight * expected_upper_ons
     
     # Apply transport adjustment
     expected_median_after_transport = expected_median_base * (1 + transport_adjustment_pct)
@@ -505,16 +592,30 @@ async def evaluate_property(request: EvaluateRequest):
     expected_upper_after_transport = expected_upper_base * (1 + transport_adjustment_pct)
     
     # Step 7: Calculate extra adjustments (furnished, bathrooms, floor area, quality)
-    furnished_adj = get_furnished_adjustment(request.furnished)
-    bathrooms_adj = get_bathrooms_adjustment(request.bathrooms, request.bedrooms)
-    floor_area_adj = get_floor_area_adjustment(request.floor_area_sqm, request.bedrooms)
-    quality_adj = get_quality_adjustment(request.quality)
+    furnished_adj_base = get_furnished_adjustment(request.furnished)
+    bathrooms_adj_base = get_bathrooms_adjustment(request.bathrooms, request.bedrooms)
+    floor_area_adj_base = get_floor_area_adjustment(request.floor_area_sqm, request.bedrooms)
+    quality_adj_base = get_quality_adjustment(request.quality)
+    
+    # Apply similarity dampening if strong_similarity is True
+    if strong_similarity:
+        similarity_dampening_factor = 0.4
+        # Dampen extra adjustments only (not transport)
+        furnished_adj = furnished_adj_base * similarity_dampening_factor
+        bathrooms_adj = bathrooms_adj_base * similarity_dampening_factor
+        floor_area_adj = floor_area_adj_base * similarity_dampening_factor
+        quality_adj = quality_adj_base * similarity_dampening_factor
+    else:
+        furnished_adj = furnished_adj_base
+        bathrooms_adj = bathrooms_adj_base
+        floor_area_adj = floor_area_adj_base
+        quality_adj = quality_adj_base
     
     # Combine extra adjustments and cap to [-0.12, +0.12]
     extra_adjustment_pct = furnished_adj + bathrooms_adj + floor_area_adj + quality_adj
     extra_adjustment_pct = max(-0.12, min(0.12, extra_adjustment_pct))
     
-    # Build adjustments breakdown
+    # Build adjustments breakdown (show original values for transparency)
     adjustments_breakdown = {
         "transport": transport_adjustment_pct,
         "furnished": furnished_adj,
@@ -532,15 +633,7 @@ async def evaluate_property(request: EvaluateRequest):
     # Step 8: Calculate deviation
     deviation_pct = (request.price_pcm - expected_median) / expected_median
     
-    # Step 9: Classification
-    if deviation_pct <= -0.10:
-        classification = "undervalued"
-    elif deviation_pct >= 0.10:
-        classification = "overvalued"
-    else:
-        classification = "fair"
-    
-    # Step 10: Confidence (improved scoring)
+    # Step 9: Confidence (improved scoring)
     # Start from ONS count_rents thresholds
     if pd.isna(count_rents) or count_rents < 300 or borough == "unknown":
         confidence = "low"
@@ -563,6 +656,36 @@ async def evaluate_property(request: EvaluateRequest):
         elif confidence == "medium":
             confidence = "low"
     
+    # Reduce confidence by 1 level if structural divergence detected
+    confidence_adjusted = False
+    if structural_divergence:
+        confidence_adjusted = True
+        if confidence == "high":
+            confidence = "medium"
+        elif confidence == "medium":
+            confidence = "low"
+    
+    # Step 9.5: Confidence-aware deviation damping
+    deviation_pct_damped = deviation_pct
+    if confidence == "low":
+        deviation_pct_damped = deviation_pct * 0.65
+        # Expand expected range by ±25% around median
+        range_expansion = 0.25
+        expected_lower = expected_median * (1 - range_expansion)
+        expected_upper = expected_median * (1 + range_expansion)
+        expected_range = [expected_lower, expected_upper]
+    elif confidence == "medium":
+        deviation_pct_damped = deviation_pct * 0.85
+    # high confidence: no damping
+    
+    # Step 10: Classification (recompute after damping)
+    if deviation_pct_damped <= -0.10:
+        classification = "undervalued"
+    elif deviation_pct_damped >= 0.10:
+        classification = "overvalued"
+    else:
+        classification = "fair"
+    
     # Generate explanations with transparent breakdown
     explanations = []
     explanations.append(f"Property located in {borough}")
@@ -570,8 +693,20 @@ async def evaluate_property(request: EvaluateRequest):
     explanations.append(f"Bedroom multiplier ({bedrooms_key} bedroom {request.property_type}): {multiplier:.2f}x → £{expected_median_ons:.2f}/month")
     
     if comps_used:
-        explanations.append(f"Comparables estimate: {comps_sample_size} recent properties within {comps_radius_m:.0f}m (time-on-market weighted) → £{comps_expected_median:.2f}/month")
-        explanations.append(f"Blended estimate (70% comps, 30% ONS baseline): £{expected_median_base:.2f}/month")
+        radius_note = ""
+        if adaptive_radius_used:
+            radius_note = f" (radius expanded to {comps_radius_m:.0f}m to find sufficient comparables)"
+        explanations.append(f"Comparables estimate: {comps_sample_size} recent properties within {comps_radius_m:.0f}m{radius_note} (time-on-market weighted) → £{comps_expected_median:.2f}/month")
+        
+        if structural_divergence:
+            explanations.append("Large divergence between statistical baseline and local comparables - using comparables-only estimate")
+        elif is_prime_central:
+            if ons_weight == 0.0:
+                explanations.append("ONS borough medians are less representative in prime central locations - using comparables-only estimate")
+            else:
+                explanations.append(f"ONS borough medians are less representative in prime central locations - blended estimate ({comps_weight*100:.0f}% comps, {ons_weight*100:.0f}% ONS): £{expected_median_base:.2f}/month")
+        else:
+            explanations.append(f"Blended estimate ({comps_weight*100:.0f}% comps, {ons_weight*100:.0f}% ONS baseline): £{expected_median_base:.2f}/month")
     else:
         explanations.append("Comparables not available or insufficient sample size - using ONS baseline only")
     
@@ -589,11 +724,27 @@ async def evaluate_property(request: EvaluateRequest):
         if adjustments_breakdown["quality"] != 0:
             adj_details.append(f"quality: {adjustments_breakdown['quality']*100:+.1f}%")
         if adj_details:
-            explanations.append(f"Extra adjustments ({', '.join(adj_details)}): {extra_adjustment_pct*100:+.1f}% → £{expected_median:.2f}/month")
+            dampening_note = ""
+            if strong_similarity:
+                dampening_note = " (dampened due to strong local comparables)"
+            explanations.append(f"Extra adjustments ({', '.join(adj_details)}): {extra_adjustment_pct*100:+.1f}% → £{expected_median:.2f}/month{dampening_note}")
+    
+    if strong_similarity:
+        explanations.append("Strong local comparables detected; feature adjustments reduced to avoid double-counting quality already reflected in comparable prices.")
     
     explanations.append(f"Final expected median: £{expected_median:.2f}/month (range: £{expected_lower:.2f} - £{expected_upper:.2f})")
-    explanations.append(f"Listed price is {abs(deviation_pct)*100:.1f}% {'below' if deviation_pct < 0 else 'above'} expected median")
-    explanations.append(f"Confidence level: {confidence} (based on {int(count_rents) if pd.notna(count_rents) else 0} rental records)")
+    
+    # Deviation explanation with damping note
+    if deviation_pct != deviation_pct_damped:
+        damping_note = f" (damped from {abs(deviation_pct)*100:.1f}% due to {confidence} confidence)"
+        explanations.append(f"Listed price is {abs(deviation_pct_damped)*100:.1f}% {'below' if deviation_pct_damped < 0 else 'above'} expected median{damping_note}")
+    else:
+        explanations.append(f"Listed price is {abs(deviation_pct_damped)*100:.1f}% {'below' if deviation_pct_damped < 0 else 'above'} expected median")
+    
+    confidence_note = ""
+    if confidence_adjusted:
+        confidence_note = " (adjusted due to data quality issues)"
+    explanations.append(f"Confidence level: {confidence} (based on {int(count_rents) if pd.notna(count_rents) else 0} rental records){confidence_note}")
     explanations.append("Note: This is a borough baseline + size + accessibility estimate, not a guaranteed 'true rent'")
     
     return EvaluateResponse(
@@ -614,7 +765,12 @@ async def evaluate_property(request: EvaluateRequest):
         comps_sample_size=comps_sample_size,
         comps_radius_m=comps_radius_m,
         comps_expected_median_pcm=comps_expected_median,
-        comps_expected_range_pcm=comps_expected_range
+        comps_expected_range_pcm=comps_expected_range,
+        deviation_pct_damped=deviation_pct_damped,
+        confidence_adjusted=confidence_adjusted,
+        adaptive_radius_used=adaptive_radius_used,
+        strong_similarity=strong_similarity,
+        similarity_dampening_factor=similarity_dampening_factor
     )
 
 @app.get("/health")
