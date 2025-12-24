@@ -34,6 +34,11 @@ interface EvaluateResponse {
     size: number
     quality: number
   }
+  comps_used: boolean
+  comps_sample_size: number
+  comps_radius_m: number
+  comps_expected_median_pcm: number
+  comps_expected_range_pcm: [number, number]
 }
 
 export default function Home() {
@@ -332,6 +337,29 @@ export default function Home() {
                     </p>
                   </div>
                 )}
+
+                <div className="bg-blue-50 p-4 rounded-md border border-blue-200">
+                  <p className="text-sm font-medium text-blue-900 mb-2">Comparables</p>
+                  <p className="text-sm text-blue-800 mb-1">
+                    Comparables used: <span className="font-semibold">{result.comps_used ? 'Yes' : 'No'}</span>
+                  </p>
+                  {result.comps_used && (
+                    <>
+                      <p className="text-sm text-blue-800 mb-1">
+                        Sample size: <span className="font-semibold">{result.comps_sample_size}</span>
+                      </p>
+                      <p className="text-sm text-blue-800 mb-1">
+                        Radius: <span className="font-semibold">{result.comps_radius_m.toFixed(0)}m</span>
+                      </p>
+                      <p className="text-xs text-blue-700 mt-2 pt-2 border-t border-blue-300">
+                        Comparable estimate: £{result.comps_expected_median_pcm.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/month
+                      </p>
+                      <p className="text-xs text-blue-700">
+                        Final blended estimate: £{result.expected_median_pcm.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/month
+                      </p>
+                    </>
+                  )}
+                </div>
               </div>
 
               <div className={`border-2 rounded-md p-4 ${getClassificationColor(result.classification)}`}>

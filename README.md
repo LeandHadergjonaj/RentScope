@@ -145,6 +145,28 @@ Then open `http://localhost:3000` in your browser.
 - Classification (undervalued/fair/overvalued)
 - Confidence scoring based on data quality
 
+## Building Comparables Dataset
+
+To convert the source rental ads data into the comparables format used by the evaluation engine:
+
+```bash
+make build-comparables
+```
+
+Or directly:
+```bash
+python backend/scripts/build_comparables.py
+```
+
+This script:
+- Reads `data/rent_ads_rightmove_extended.csv`
+- Normalizes and maps columns to the comparables schema
+- Resolves postcodes to lat/lon coordinates
+- Filters outliers and invalid data
+- Outputs `data/comparables.csv`
+
+The backend will automatically load `data/comparables.csv` at startup if it exists.
+
 ## Technology Stack
 
 - **Backend**: FastAPI (Python)

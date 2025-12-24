@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import os
 import math
-from typing import Optional, List
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any, Tuple
 
 app = FastAPI()
 
@@ -21,6 +22,7 @@ app.add_middleware(
 ons_data: Optional[pd.DataFrame] = None
 postcode_data: Optional[pd.DataFrame] = None
 tfl_stations_data: Optional[pd.DataFrame] = None
+comps_data: Optional[pd.DataFrame] = None
 
 # Bedroom multipliers
 BEDROOM_MULTIPLIERS = {
@@ -61,6 +63,43 @@ def normalize_borough_name(name: str) -> str:
     if pd.isna(name) or name == "":
         return "unknown"
     return name.strip().title()
+
+def parse_property_type(prop_type: str) -> str:
+    """Normalize property type values"""
+    if pd.isna(prop_type):
+        return "flat"
+    prop_type_lower = str(prop_type).lower().strip()
+    if prop_type_lower in ["flat", "apartment"]:
+        return "flat"
+    elif prop_type_lower in ["house", "terraced", "semi-detached", "detached"]:
+        return "house"
+    elif prop_type_lower in ["studio", "studios"]:
+        return "studio"
+    elif prop_type_lower in ["room", "rooms", "shared"]:
+        return "room"
+    else:
+        return "flat"  # default
+
+def is_active_or_recent(last_seen: Any) -> bool:
+    """Check if comparable is active/recent (within last 45 days)"""
+    if pd.isna(last_seen):
+        return False
+    try:
+        last_seen_dt = pd.to_datetime(last_seen)
+        cutoff = datetime.now() - timedelta(days=45)
+        return last_seen_dt >= cutoff
+    except:
+        return False
+
+def time_on_market_days(first_seen: Any, last_seen: Any) -> int:
+    """Calculate time on market in days, clamped to >= 0"""
+    try:
+        first_dt = pd.to_datetime(first_seen)
+        last_dt = pd.to_datetime(last_seen)
+        days = (last_dt - first_dt).days
+        return max(0, days)
+    except:
+        return 0
 
 def get_furnished_adjustment(furnished: Optional[bool]) -> float:
     """Get furnished adjustment factor"""
@@ -103,10 +142,112 @@ def get_quality_adjustment(quality: Optional[str]) -> float:
     else:  # "average" or None
         return 0.00
 
+def select_comparables(
+    subject_lat: float,
+    subject_lon: float,
+    subject_bedrooms: int,
+    subject_property_type: str,
+    comps_df: pd.DataFrame,
+    min_comps: int = 8,
+    max_comps: int = 30
+) -> Tuple[pd.DataFrame, float]:
+    """Select and rank comparables for a subject property
+    
+    Returns:
+        (selected_comps_df, radius_m)
+    """
+    if comps_df is None or len(comps_df) == 0:
+        return pd.DataFrame(), 0.0
+    
+    # Filter by property type
+    subject_prop_type = parse_property_type(subject_property_type)
+    comps_filtered = comps_df[comps_df["property_type"].apply(parse_property_type) == subject_prop_type].copy()
+    
+    # Filter by bedrooms (within +/- 1, or +/- 2 for 4+)
+    if subject_bedrooms >= 4:
+        bedroom_tolerance = 2
+    else:
+        bedroom_tolerance = 1
+    
+    comps_filtered = comps_filtered[
+        abs(comps_filtered["bedrooms"] - subject_bedrooms) <= bedroom_tolerance
+    ]
+    
+    # Filter to recent comps (within 45 days)
+    comps_filtered = comps_filtered[
+        comps_filtered["last_seen"].apply(is_active_or_recent)
+    ]
+    
+    if len(comps_filtered) == 0:
+        return pd.DataFrame(), 0.0
+    
+    # Compute distances
+    comps_filtered["distance_m"] = comps_filtered.apply(
+        lambda row: haversine_distance(subject_lat, subject_lon, row["lat"], row["lon"]),
+        axis=1
+    )
+    
+    # Try radius 800m first, expand to 2000m if needed
+    radius_m = 800.0
+    comps_in_radius = comps_filtered[comps_filtered["distance_m"] <= radius_m]
+    
+    if len(comps_in_radius) < min_comps:
+        radius_m = 2000.0
+        comps_in_radius = comps_filtered[comps_filtered["distance_m"] <= radius_m]
+    
+    if len(comps_in_radius) < min_comps:
+        return pd.DataFrame(), radius_m
+    
+    # Compute similarity scores
+    comps_in_radius["similarity_score"] = (
+        comps_in_radius["distance_m"] / 800.0 +
+        0.7 * abs(comps_in_radius["bedrooms"] - subject_bedrooms)
+    )
+    
+    # Select top K comps
+    comps_selected = comps_in_radius.nsmallest(max_comps, "similarity_score")
+    
+    return comps_selected, radius_m
+
+def compute_comps_estimate(comps_df: pd.DataFrame) -> Tuple[float, List[float]]:
+    """Compute expected median and range from comparables using time-on-market weighting
+    
+    Returns:
+        (expected_median, [expected_lower, expected_upper])
+    """
+    if comps_df is None or len(comps_df) == 0:
+        return 0.0, [0.0, 0.0]
+    
+    # Compute time on market and weights
+    comps_df = comps_df.copy()
+    comps_df["time_on_market_days"] = comps_df.apply(
+        lambda row: time_on_market_days(row["first_seen"], row["last_seen"]),
+        axis=1
+    )
+    comps_df["weight"] = 1.0 / (1.0 + comps_df["time_on_market_days"] / 14.0)
+    
+    prices = comps_df["price_pcm"].values
+    weights = comps_df["weight"].values
+    
+    # Unweighted median
+    unweighted_median = float(prices.median())
+    
+    # Weighted mean
+    weighted_mean = float((prices * weights).sum() / weights.sum())
+    
+    # Expected median = average of unweighted median and weighted mean
+    expected_median = (unweighted_median + weighted_mean) / 2.0
+    
+    # Robust range using percentiles (25/75)
+    expected_lower = float(prices.quantile(0.25))
+    expected_upper = float(prices.quantile(0.75))
+    
+    return expected_median, [expected_lower, expected_upper]
+
 @app.on_event("startup")
 async def load_data():
     """Load CSV files at startup"""
-    global ons_data, postcode_data, tfl_stations_data
+    global ons_data, postcode_data, tfl_stations_data, comps_data
     
     data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
     
@@ -118,6 +259,26 @@ async def load_data():
         print(f"Loaded ONS data: {len(ons_data)} rows")
         print(f"Loaded postcode data: {len(postcode_data)} rows")
         print(f"Loaded TFL stations data: {len(tfl_stations_data)} rows")
+        
+        # Load comparables if available
+        comps_path = os.path.join(data_dir, "comparables.csv")
+        if os.path.exists(comps_path):
+            try:
+                comps_data = pd.read_csv(comps_path)
+                # Validate required columns
+                required_cols = ["price_pcm", "bedrooms", "property_type", "lat", "lon", "first_seen", "last_seen"]
+                missing_cols = [col for col in required_cols if col not in comps_data.columns]
+                if missing_cols:
+                    print(f"Warning: comparables.csv missing required columns: {missing_cols}")
+                    comps_data = None
+                else:
+                    print(f"Loaded comparables: {len(comps_data)} rows")
+            except Exception as e:
+                print(f"Warning: Could not load comparables.csv: {e}")
+                comps_data = None
+        else:
+            print("Warning: comparables.csv not found, continuing without comparables")
+            comps_data = None
     except Exception as e:
         print(f"Error loading data: {e}")
         raise
@@ -148,6 +309,11 @@ class EvaluateResponse(BaseModel):
     used_borough_fallback: bool
     extra_adjustment_pct: float
     adjustments_breakdown: dict
+    comps_used: bool
+    comps_sample_size: int
+    comps_radius_m: float
+    comps_expected_median_pcm: float
+    comps_expected_range_pcm: List[float]
 
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate_property(request: EvaluateRequest):
@@ -182,7 +348,12 @@ async def evaluate_property(request: EvaluateRequest):
             transport_adjustment_pct=0.0,
             used_borough_fallback=False,
             extra_adjustment_pct=0.0,
-            adjustments_breakdown={"transport": 0.0, "furnished": 0.0, "bathrooms": 0.0, "size": 0.0, "quality": 0.0}
+            adjustments_breakdown={"transport": 0.0, "furnished": 0.0, "bathrooms": 0.0, "size": 0.0, "quality": 0.0},
+            comps_used=False,
+            comps_sample_size=0,
+            comps_radius_m=0.0,
+            comps_expected_median_pcm=0.0,
+            comps_expected_range_pcm=[0.0, 0.0]
         )
     
     lat = postcode_row.iloc[0]["lat"]
@@ -231,7 +402,12 @@ async def evaluate_property(request: EvaluateRequest):
             transport_adjustment_pct=0.0,
             used_borough_fallback=used_borough_fallback,
             extra_adjustment_pct=0.0,
-            adjustments_breakdown={"transport": 0.0, "furnished": 0.0, "bathrooms": 0.0, "size": 0.0, "quality": 0.0}
+            adjustments_breakdown={"transport": 0.0, "furnished": 0.0, "bathrooms": 0.0, "size": 0.0, "quality": 0.0},
+            comps_used=False,
+            comps_sample_size=0,
+            comps_radius_m=0.0,
+            comps_expected_median_pcm=0.0,
+            comps_expected_range_pcm=[0.0, 0.0]
         )
     
     median_rent = ons_row.iloc[0]["median_rent"]
@@ -260,7 +436,12 @@ async def evaluate_property(request: EvaluateRequest):
             transport_adjustment_pct=0.0,
             used_borough_fallback=used_borough_fallback,
             extra_adjustment_pct=0.0,
-            adjustments_breakdown={"transport": 0.0, "furnished": 0.0, "bathrooms": 0.0, "size": 0.0, "quality": 0.0}
+            adjustments_breakdown={"transport": 0.0, "furnished": 0.0, "bathrooms": 0.0, "size": 0.0, "quality": 0.0},
+            comps_used=False,
+            comps_sample_size=0,
+            comps_radius_m=0.0,
+            comps_expected_median_pcm=0.0,
+            comps_expected_range_pcm=[0.0, 0.0]
         )
     
     # Step 4: Get bedroom multiplier
@@ -284,10 +465,39 @@ async def evaluate_property(request: EvaluateRequest):
     
     transport_adjustment_pct = get_transport_adjustment(nearest_station_distance_m)
     
-    # Step 6: Calculate expected values (before transport adjustment)
-    expected_median_base = median_rent * multiplier
-    expected_lower_base = (lower_quartile * multiplier) if pd.notna(lower_quartile) else expected_median_base * 0.8
-    expected_upper_base = (upper_quartile * multiplier) if pd.notna(upper_quartile) else expected_median_base * 1.2
+    # Step 6: Calculate ONS baseline expected values
+    expected_median_ons = median_rent * multiplier
+    expected_lower_ons = (lower_quartile * multiplier) if pd.notna(lower_quartile) else expected_median_ons * 0.8
+    expected_upper_ons = (upper_quartile * multiplier) if pd.notna(upper_quartile) else expected_median_ons * 1.2
+    
+    # Step 6.5: Try to get comparables estimate
+    comps_used = False
+    comps_sample_size = 0
+    comps_radius_m = 0.0
+    comps_expected_median = 0.0
+    comps_expected_range = [0.0, 0.0]
+    
+    if comps_data is not None and len(comps_data) > 0:
+        comps_selected, comps_radius_m = select_comparables(
+            lat, lon, request.bedrooms, request.property_type, comps_data
+        )
+        
+        if len(comps_selected) >= 8:
+            comps_expected_median, comps_expected_range = compute_comps_estimate(comps_selected)
+            comps_used = True
+            comps_sample_size = len(comps_selected)
+    
+    # Step 6.6: Blend comps with ONS baseline
+    if comps_used:
+        # Blend: 70% comps, 30% ONS
+        expected_median_base = 0.7 * comps_expected_median + 0.3 * expected_median_ons
+        expected_lower_base = 0.7 * comps_expected_range[0] + 0.3 * expected_lower_ons
+        expected_upper_base = 0.7 * comps_expected_range[1] + 0.3 * expected_upper_ons
+    else:
+        # Fall back to ONS only
+        expected_median_base = expected_median_ons
+        expected_lower_base = expected_lower_ons
+        expected_upper_base = expected_upper_ons
     
     # Apply transport adjustment
     expected_median_after_transport = expected_median_base * (1 + transport_adjustment_pct)
@@ -357,7 +567,13 @@ async def evaluate_property(request: EvaluateRequest):
     explanations = []
     explanations.append(f"Property located in {borough}")
     explanations.append(f"Base ONS median rent for borough: £{median_rent:.2f}/month")
-    explanations.append(f"Bedroom multiplier ({bedrooms_key} bedroom {request.property_type}): {multiplier:.2f}x → £{expected_median_base:.2f}/month")
+    explanations.append(f"Bedroom multiplier ({bedrooms_key} bedroom {request.property_type}): {multiplier:.2f}x → £{expected_median_ons:.2f}/month")
+    
+    if comps_used:
+        explanations.append(f"Comparables estimate: {comps_sample_size} recent properties within {comps_radius_m:.0f}m (time-on-market weighted) → £{comps_expected_median:.2f}/month")
+        explanations.append(f"Blended estimate (70% comps, 30% ONS baseline): £{expected_median_base:.2f}/month")
+    else:
+        explanations.append("Comparables not available or insufficient sample size - using ONS baseline only")
     
     if transport_adjustment_pct != 0:
         explanations.append(f"Transport adjustment ({nearest_station_distance_m:.0f}m to nearest station): {transport_adjustment_pct*100:+.1f}% → £{expected_median_after_transport:.2f}/month")
@@ -393,11 +609,86 @@ async def evaluate_property(request: EvaluateRequest):
         transport_adjustment_pct=transport_adjustment_pct,
         used_borough_fallback=used_borough_fallback,
         extra_adjustment_pct=extra_adjustment_pct,
-        adjustments_breakdown=adjustments_breakdown
+        adjustments_breakdown=adjustments_breakdown,
+        comps_used=comps_used,
+        comps_sample_size=comps_sample_size,
+        comps_radius_m=comps_radius_m,
+        comps_expected_median_pcm=comps_expected_median,
+        comps_expected_range_pcm=comps_expected_range
     )
 
 @app.get("/health")
 async def health():
     """Health check endpoint"""
     return {"ok": True}
+
+@app.get("/debug/comps")
+async def debug_comps(
+    postcode: str = Query(..., description="Postcode to search"),
+    bedrooms: int = Query(..., description="Number of bedrooms"),
+    property_type: str = Query(..., description="Property type")
+):
+    """Debug endpoint to see selected comparables (top 10)"""
+    if comps_data is None or len(comps_data) == 0:
+        return {"error": "Comparables data not loaded"}
+    
+    if postcode_data is None:
+        return {"error": "Postcode data not loaded"}
+    
+    # Find postcode location
+    postcode_normalized = postcode.replace(" ", "").upper()
+    postcode_row = postcode_data[
+        postcode_data["postcode_nospace"].str.upper() == postcode_normalized
+    ]
+    
+    if postcode_row.empty:
+        postcode_row = postcode_data[
+            postcode_data["postcode"].str.upper() == postcode.upper()
+        ]
+    
+    if postcode_row.empty:
+        return {"error": "Postcode not found"}
+    
+    lat = postcode_row.iloc[0]["lat"]
+    lon = postcode_row.iloc[0]["lon"]
+    
+    # Select comparables
+    comps_selected, radius_m = select_comparables(
+        lat, lon, bedrooms, property_type, comps_data, min_comps=1, max_comps=10
+    )
+    
+    if len(comps_selected) == 0:
+        return {
+            "postcode": postcode,
+            "lat": lat,
+            "lon": lon,
+            "bedrooms": bedrooms,
+            "property_type": property_type,
+            "comps_found": 0,
+            "radius_m": radius_m,
+            "comps": []
+        }
+    
+    # Prepare response
+    comps_list = []
+    for _, comp in comps_selected.head(10).iterrows():
+        time_on_market = time_on_market_days(comp["first_seen"], comp["last_seen"])
+        comps_list.append({
+            "price_pcm": float(comp["price_pcm"]),
+            "distance_m": float(comp["distance_m"]),
+            "time_on_market_days": time_on_market,
+            "bedrooms": int(comp["bedrooms"]),
+            "property_type": str(comp["property_type"])
+        })
+    
+    return {
+        "postcode": postcode,
+        "lat": lat,
+        "lon": lon,
+        "bedrooms": bedrooms,
+        "property_type": property_type,
+        "comps_found": len(comps_selected),
+        "radius_m": float(radius_m),
+        "comps": comps_list
+    }
 
