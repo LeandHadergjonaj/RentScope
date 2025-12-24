@@ -8,6 +8,10 @@ interface EvaluateRequest {
   bedrooms: number
   property_type: string
   postcode: string
+  bathrooms?: number | null
+  floor_area_sqm?: number | null
+  furnished?: boolean | null
+  quality?: string
 }
 
 interface EvaluateResponse {
@@ -19,6 +23,17 @@ interface EvaluateResponse {
   classification: 'undervalued' | 'fair' | 'overvalued'
   confidence: 'low' | 'medium' | 'high'
   explanations: string[]
+  nearest_station_distance_m: number
+  transport_adjustment_pct: number
+  used_borough_fallback: boolean
+  extra_adjustment_pct: number
+  adjustments_breakdown: {
+    transport: number
+    furnished: number
+    bathrooms: number
+    size: number
+    quality: number
+  }
 }
 
 export default function Home() {
@@ -28,6 +43,10 @@ export default function Home() {
     bedrooms: 1,
     property_type: 'flat',
     postcode: '',
+    bathrooms: null,
+    floor_area_sqm: null,
+    furnished: null,
+    quality: 'average',
   })
   const [result, setResult] = useState<EvaluateResponse | null>(null)
   const [loading, setLoading] = useState(false)
@@ -40,12 +59,15 @@ export default function Home() {
     setResult(null)
 
     try {
-      const response = await fetch('http://localhost:8000/evaluate', {
+      const response = await fetch('/api/evaluate', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(formData),
+        body: JSON.stringify({
+          ...formData,
+          quality: formData.quality || 'average',
+        }),
       })
 
       if (!response.ok) {
@@ -167,6 +189,83 @@ export default function Home() {
               />
             </div>
 
+            <div className="border-t pt-4 mt-4">
+              <p className="text-sm font-medium text-gray-700 mb-3">Optional Details (for more accurate evaluation)</p>
+              
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="bathrooms" className="block text-sm font-medium text-gray-700 mb-2">
+                    Bathrooms (optional)
+                  </label>
+                  <input
+                    type="number"
+                    id="bathrooms"
+                    min="0"
+                    value={formData.bathrooms || ''}
+                    onChange={(e) =>
+                      setFormData({ ...formData, bathrooms: e.target.value ? parseInt(e.target.value) : null })
+                    }
+                    className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                    placeholder="e.g. 2"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="floor_area_sqm" className="block text-sm font-medium text-gray-700 mb-2">
+                    Floor Area (sqm, optional)
+                  </label>
+                  <input
+                    type="number"
+                    id="floor_area_sqm"
+                    min="0"
+                    step="0.1"
+                    value={formData.floor_area_sqm || ''}
+                    onChange={(e) =>
+                      setFormData({ ...formData, floor_area_sqm: e.target.value ? parseFloat(e.target.value) : null })
+                    }
+                    className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                    placeholder="e.g. 75.5"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="furnished" className="block text-sm font-medium text-gray-700 mb-2">
+                    Furnished (optional)
+                  </label>
+                  <select
+                    id="furnished"
+                    value={formData.furnished === null ? 'unknown' : formData.furnished ? 'yes' : 'no'}
+                    onChange={(e) =>
+                      setFormData({ ...formData, furnished: e.target.value === 'unknown' ? null : e.target.value === 'yes' })
+                    }
+                    className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  >
+                    <option value="unknown">Unknown</option>
+                    <option value="yes">Yes</option>
+                    <option value="no">No</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label htmlFor="quality" className="block text-sm font-medium text-gray-700 mb-2">
+                    Quality (optional)
+                  </label>
+                  <select
+                    id="quality"
+                    value={formData.quality || 'average'}
+                    onChange={(e) =>
+                      setFormData({ ...formData, quality: e.target.value })
+                    }
+                    className="w-full px-4 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  >
+                    <option value="dated">Dated</option>
+                    <option value="average">Average</option>
+                    <option value="modern">Modern</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
             <button
               type="submit"
               disabled={loading}
@@ -215,6 +314,24 @@ export default function Home() {
                     £{result.expected_range_pcm[0].toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} - £{result.expected_range_pcm[1].toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/month
                   </p>
                 </div>
+
+                {result.nearest_station_distance_m > 0 && (
+                  <div className="bg-gray-50 p-4 rounded-md">
+                    <p className="text-sm text-gray-600 mb-1">Nearest Station</p>
+                    <p className="text-lg font-semibold text-gray-900">
+                      {result.nearest_station_distance_m.toFixed(0)}m
+                    </p>
+                  </div>
+                )}
+
+                {result.transport_adjustment_pct !== 0 && (
+                  <div className="bg-gray-50 p-4 rounded-md">
+                    <p className="text-sm text-gray-600 mb-1">Transport Adjustment</p>
+                    <p className={`text-lg font-semibold ${result.transport_adjustment_pct > 0 ? 'text-green-600' : 'text-red-600'}`}>
+                      {result.transport_adjustment_pct > 0 ? '+' : ''}{result.transport_adjustment_pct.toFixed(1)}%
+                    </p>
+                  </div>
+                )}
               </div>
 
               <div className={`border-2 rounded-md p-4 ${getClassificationColor(result.classification)}`}>
@@ -228,7 +345,40 @@ export default function Home() {
               <div className={`rounded-md p-4 ${getConfidenceColor(result.confidence)}`}>
                 <p className="text-sm font-medium mb-1">Confidence</p>
                 <p className="text-lg font-semibold capitalize">{result.confidence}</p>
+                <p className="text-xs mt-1 opacity-75">
+                  {result.confidence === 'high' && 'High confidence: Based on extensive rental data'}
+                  {result.confidence === 'medium' && 'Medium confidence: Based on moderate rental data'}
+                  {result.confidence === 'low' && 'Low confidence: Limited data available or data quality issues'}
+                </p>
               </div>
+
+              {(result.extra_adjustment_pct !== 0 || Object.values(result.adjustments_breakdown).some(v => v !== 0)) && (
+                <div className="bg-purple-50 border border-purple-200 rounded-md p-4">
+                  <p className="text-sm font-medium text-purple-900 mb-2">Adjustments Breakdown</p>
+                  <ul className="space-y-1 text-sm text-purple-800">
+                    {result.adjustments_breakdown.transport !== 0 && (
+                      <li>Transport: {result.adjustments_breakdown.transport > 0 ? '+' : ''}{result.adjustments_breakdown.transport.toFixed(1)}%</li>
+                    )}
+                    {result.adjustments_breakdown.furnished !== 0 && (
+                      <li>Furnished: {result.adjustments_breakdown.furnished > 0 ? '+' : ''}{result.adjustments_breakdown.furnished.toFixed(1)}%</li>
+                    )}
+                    {result.adjustments_breakdown.bathrooms !== 0 && (
+                      <li>Bathrooms: {result.adjustments_breakdown.bathrooms > 0 ? '+' : ''}{result.adjustments_breakdown.bathrooms.toFixed(1)}%</li>
+                    )}
+                    {result.adjustments_breakdown.size !== 0 && (
+                      <li>Size: {result.adjustments_breakdown.size > 0 ? '+' : ''}{result.adjustments_breakdown.size.toFixed(1)}%</li>
+                    )}
+                    {result.adjustments_breakdown.quality !== 0 && (
+                      <li>Quality: {result.adjustments_breakdown.quality > 0 ? '+' : ''}{result.adjustments_breakdown.quality.toFixed(1)}%</li>
+                    )}
+                    {result.extra_adjustment_pct !== 0 && (
+                      <li className="font-semibold mt-2 pt-2 border-t border-purple-300">
+                        Total Extra Adjustment: {result.extra_adjustment_pct > 0 ? '+' : ''}{result.extra_adjustment_pct.toFixed(1)}%
+                      </li>
+                    )}
+                  </ul>
+                </div>
+              )}
 
               <div className="bg-blue-50 border border-blue-200 rounded-md p-4">
                 <p className="text-sm font-medium text-blue-900 mb-2">Explanations</p>
