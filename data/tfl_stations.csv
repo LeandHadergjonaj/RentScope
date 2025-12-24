@@ -1,0 +1,270 @@
+name,lat,lon,railway,station,public_transport,network,line
+Shepherd's Bush Market,51.50607,-0.2263134,station,subway,station,London Underground,Hammersmith & City;Circle
+Finchley Central,51.6008355,-0.192318,station,subway,station,London Underground,Northern
+Sloane Square,51.4922264,-0.1558767,station,subway,station,London Underground,District;Circle
+Wimbledon,51.4220721,-0.2052902,station,subway,station,National Rail;London Underground;London Trams,District
+Mansion House,51.5118924,-0.0952228,station,subway,station,London Underground,District;Circle
+North Harrow,51.5851618,-0.3631762,station,subway,station,London Underground,Metropolitan
+Harrow & Wealdstone,51.5922178,-0.3348748,station,subway,station,London Underground;London Overground,Bakerloo
+North Ealing,51.5174885,-0.2887523,station,subway,station,London Underground,Piccadilly
+Ruislip Gardens,51.5606573,-0.4104614,station,subway,station,London Underground,Central
+South Kenton,51.5703076,-0.3085107,station,subway,station,London Underground;London Overground,Bakerloo
+North Wembley,51.5624017,-0.3038698,station,subway,station,London Underground;London Overground,Bakerloo
+Tooting Bec,51.4356228,-0.1597188,station,subway,station,London Underground,Northern
+Clapham North,51.4653034,-0.1296388,station,subway,station,London Underground,Northern
+Oval,51.4818339,-0.1123953,station,subway,station,London Underground,Northern
+Kennington,51.4882861,-0.1058829,station,subway,station,London Underground,Northern
+St. James's Park,51.4992816,-0.1345942,station,subway,station,London Underground,District;Circle
+Westminster,51.5013562,-0.1249302,station,subway,station,London Underground,District;Circle;Jubilee
+Brixton,51.4626097,-0.114705,station,subway,station,London Underground,Victoria
+Blackhorse Road,51.5867174,-0.0416453,station,subway,station,London Underground;London Overground,Victoria
+Clapham South,51.4528372,-0.1475523,station,subway,station,London Underground,Northern
+Balham,51.4433857,-0.1528977,station,subway,station,London Underground,Northern
+Tooting Broadway,51.4277387,-0.1682905,station,subway,station,London Underground,Northern
+Colliers Wood,51.4182747,-0.1778626,station,subway,station,London Underground,Northern
+South Wimbledon,51.4151759,-0.1926457,station,subway,station,London Underground,Northern
+Redbridge,51.5763203,0.0454097,station,subway,station,London Underground,Central
+Old Street,51.5256284,-0.0876094,station,subway,station,National Rail;London Underground,Northern City;Northern
+Kenton,51.5815255,-0.3166378,station,subway,station,London Underground;London Overground,Bakerloo
+King's Cross St Pancras,51.530609,-0.1239491,station,subway,station,London Underground,Metropolitan;Northern;Piccadilly;Circle;Victoria;Hammersmith & City
+Stockwell,51.472211,-0.1225014,station,subway,station,London Underground,Northern;Victoria
+Arsenal,51.5583839,-0.1074866,station,subway,station,London Underground,Piccadilly
+Pimlico,51.4891579,-0.1353308,station,subway,station,London Underground,Victoria
+Victoria,51.4963688,-0.1431522,station,subway,station,London Underground,District;Circle;Victoria
+Upminster,51.5589708,0.2516815,station,subway,station,National Rail;London Underground;London Overground,District
+Wembley Park,51.5636297,-0.2800532,station,subway,station,London Underground,Metropolitan;Jubilee
+Finsbury Park,51.5648345,-0.1064144,station,subway,station,National Rail;London Underground,Piccadilly;Victoria
+Baker Street,51.5225853,-0.1567431,station,subway,station,London Underground,Circle;Hammersmith & City;Bakerloo;Jubilee;Metropolitan
+Paddington,51.5154795,-0.175365,station,subway,station,London Underground,District;Circle;Bakerloo
+Archway,51.5653116,-0.1348189,station,subway,station,London Underground,Northern
+East Acton,51.5173451,-0.248137,station,subway,station,London Underground,Central
+Snaresbrook,51.5808033,0.0215864,station,subway,station,London Underground,Central
+Bank,51.5131048,-0.0893749,station,subway,station,London Underground;Docklands Light Railway,Northern;Central;Waterloo & City
+Heathrow Terminal 4,51.4588093,-0.4454717,station,subway,station,London Underground,Piccadilly
+Barons Court,51.4903477,-0.2144055,station,subway,station,London Underground,District;Piccadilly
+Arnos Grove,51.6164256,-0.1330981,station,subway,station,London Underground,Piccadilly
+Angel,51.5324874,-0.1060356,station,subway,station,London Underground,Northern
+Camden Town,51.5394397,-0.1426957,station,subway,station,London Underground,Northern
+East Finchley,51.5871881,-0.1648137,station,subway,station,London Underground,Northern
+Highgate,51.5776825,-0.1458316,station,subway,station,London Underground,Northern
+Tufnell Park,51.5568005,-0.138457,station,subway,station,London Underground,Northern
+Hendon Central,51.5834006,-0.2265541,station,subway,station,London Underground,Northern
+High Barnet,51.650399,-0.1938826,station,subway,station,London Underground,Northern
+Brent Cross,51.5768177,-0.2139731,station,subway,station,London Underground,Northern
+Greenford,51.5421177,-0.3447996,station,subway,station,National Rail;London Underground,Central
+Mill Hill East,51.6082746,-0.2101451,station,subway,station,London Underground,Northern
+West Finchley,51.6094298,-0.1883313,station,subway,station,London Underground,Northern
+Woodside Park,51.617938,-0.185523,station,subway,station,London Underground,Northern
+Epping,51.6936318,0.1139888,station,subway,station,London Underground,Central
+South Harrow,51.5646517,-0.3522211,station,subway,station,London Underground,Piccadilly
+Sudbury Town,51.550751,-0.3156202,station,subway,station,London Underground,Piccadilly
+Sudbury Hill,51.5568815,-0.3362525,station,subway,station,London Underground,Piccadilly
+Edgware Road,51.5201935,-0.1667636,station,subway,station,London Underground,Circle;District;Hammersmith & City
+Whitechapel,51.5197615,-0.0600874,station,subway,station,London Underground;London Overground;Elizabeth line,District;Hammersmith & City;Windrush
+Barbican,51.5201797,-0.0986342,station,subway,station,London Underground,Metropolitan;Circle;Hammersmith & City
+Barkingside,51.5858181,0.0886245,station,subway,station,London Underground,Central
+Bond Street,51.5139808,-0.1494231,station,subway,station,London Underground,Central;Jubilee
+Buckhurst Hill,51.6259439,0.0468161,station,subway,station,London Underground,Central
+Chancery Lane,51.5181738,-0.1117642,station,subway,station,London Underground,Central
+Chigwell,51.6176444,0.0757204,station,subway,station,London Underground,Central
+Debden,51.6452814,0.083583,station,subway,station,London Underground,Central
+Fairlop,51.5959477,0.0911302,station,subway,station,London Underground,Central
+Gants Hill,51.576525,0.0648799,station,subway,station,London Underground,Central
+Grange Hill,51.613134,0.0925025,station,subway,station,London Underground,Central
+Hainault,51.6033138,0.0933827,station,subway,station,London Underground,Central
+Mile End,51.5253378,-0.033435,station,subway,station,London Underground,Central;District;Hammersmith & City
+Monument,51.5106328,-0.0861271,station,subway,station,London Underground,District;Circle
+Roding Valley,51.6170812,0.0437553,station,subway,station,London Underground,Central
+Farringdon,51.519964,-0.104555,station,subway,station,National Rail;London Underground;Elizabeth line,Metropolitan;Circle;Hammersmith & City;Elizabeth line;Thameslink
+Leicester Square,51.5114642,-0.1282641,station,subway,station,London Underground,Piccadilly;Northern
+Liverpool Street,51.5176777,-0.0825205,station,subway,station,London Underground,Central
+Cannon Street,51.5113812,-0.0903632,station,subway,station,London Underground,Circle;District
+Piccadilly Circus,51.5098192,-0.1345484,station,subway,station,London Underground,Piccadilly;Bakerloo
+Waterloo,51.5030015,-0.1139812,station,subway,station,London Underground,Jubilee;Northern;Bakerloo;Waterloo & City
+Charing Cross,51.5079664,-0.1263945,station,subway,station,London Underground,Bakerloo;Northern
+Elephant & Castle,51.4948884,-0.1005731,station,subway,station,London Underground,Bakerloo;Northern
+Euston,51.5282865,-0.1338745,station,subway,station,London Underground,Northern;Victoria
+Holborn,51.5171149,-0.1200657,station,subway,station,London Underground,Central;Piccadilly
+Wimbledon Park,51.4340563,-0.1990432,station,subway,station,London Underground,District
+Ravenscourt Park,51.4941293,-0.2357932,station,subway,station,London Underground,District
+Blackfriars,51.5115854,-0.1037671,station,subway,station,London Underground,Circle;District
+Lambeth North,51.4989328,-0.1120142,station,subway,station,London Underground,Bakerloo
+Aldgate,51.5142477,-0.0757186,station,subway,station,London Underground,Metropolitan
+Seven Sisters,51.5824738,-0.0749325,station,subway,station,National Rail;London Underground;London Overground,Victoria
+Southfields,51.4457751,-0.2066142,station,subway,station,London Underground,District
+Vauxhall,51.4860091,-0.1248604,station,subway,station,Elizabeth line,Victoria
+South Ealing,51.5008623,-0.3076815,station,subway,station,London Underground,Piccadilly
+Upton Park,51.5351062,0.0339842,station,subway,station,London Underground,District;Hammersmith & City
+Clapham Common,51.4620748,-0.1373589,station,subway,station,London Underground,Northern
+White City,51.5119347,-0.2242361,station,subway,station,London Underground,Central
+Paddington,51.5185075,-0.1787546,station,subway,station,London Underground,Circle;Hammersmith & City
+South Woodford,51.5917798,0.0274276,station,subway,station,London Underground,Central
+West Ruislip,51.5695047,-0.4370447,station,subway,station,National Rail;London Underground,Central
+Aldgate East,51.5156185,-0.070839,station,subway,station,London Underground,District;Hammersmith & City
+Parsons Green,51.4750837,-0.201549,station,subway,station,London Underground,District
+Fulham Broadway,51.4808834,-0.1943493,station,subway,station,London Underground,District
+Plaistow,51.5311544,0.0166833,station,subway,station,London Underground,District;Hammersmith & City
+Bow Road,51.5268535,-0.024789,station,subway,station,London Underground,District;Hammersmith & City
+Stepney Green,51.5217026,-0.0467147,station,subway,station,London Underground,District;Hammersmith & City
+Oakwood,51.6473302,-0.1312548,station,subway,station,London Underground,Piccadilly
+West Kensington,51.4907023,-0.2059442,station,subway,station,London Underground,District
+West Brompton,51.4869765,-0.1951854,station,subway,station,London Underground;London Overground,District
+Boston Manor,51.4953386,-0.3254399,station,subway,station,London Underground,Piccadilly
+Heathrow Terminals 2 & 3,51.4713416,-0.452483,station,subway,station,Elizabeth line,Piccadilly
+Heathrow Terminal 5,51.472515,-0.4877331,station,subway,station,London Underground,Piccadilly
+Knightsbridge,51.5015961,-0.160937,station,subway,station,London Underground,Piccadilly
+Hounslow West,51.4735822,-0.3858181,station,subway,station,London Underground,Piccadilly
+Mornington Crescent,51.5340608,-0.1380918,station,subway,station,London Underground,Northern
+Hounslow East,51.4734727,-0.3558944,station,subway,station,London Underground,Piccadilly
+Hounslow Central,51.471307,-0.3662332,station,subway,station,London Underground,Piccadilly
+Southgate,51.6323183,-0.1277858,station,subway,station,London Underground,Piccadilly
+Cockfosters,51.651366,-0.1485149,station,subway,station,London Underground,Piccadilly
+Burnt Oak,51.6028082,-0.2640125,station,subway,station,London Underground,Northern
+Putney Bridge,51.4682995,-0.2087947,station,subway,station,London Underground,District
+Northfields,51.4996647,-0.312979,station,subway,station,London Underground,Piccadilly
+London Bridge,51.5054118,-0.0886993,station,subway,station,London Underground,Jubilee;Northern
+Hyde Park Corner,51.5027264,-0.1543249,station,subway,station,London Underground,Piccadilly
+Lancaster Gate,51.5118458,-0.175108,station,subway,station,London Underground,Central
+Newbury Park,51.5754985,0.0899693,station,subway,station,London Underground,Central
+Moor Park,51.6297793,-0.4321576,station,subway,station,London Underground,Metropolitan
+Rickmansworth,51.6402275,-0.4736305,station,subway,station,National Rail;London Underground,Metropolitan
+Ealing Common,51.5097107,-0.2881658,station,subway,station,London Underground,District;Piccadilly
+Kingsbury,51.5843174,-0.2787137,station,subway,station,London Underground,Jubilee
+Queensbury,51.5941903,-0.286181,station,subway,station,London Underground,Jubilee
+Northwick Park,51.578491,-0.3176997,station,subway,station,London Underground,Metropolitan
+Preston Road,51.5722732,-0.2958081,station,subway,station,London Underground,Metropolitan
+Finchley Road,51.5472307,-0.1806964,station,subway,station,London Underground,Metropolitan;Jubilee
+West Harrow,51.5795991,-0.3531364,station,subway,station,London Underground,Metropolitan
+Eastcote,51.5766614,-0.3965092,station,subway,station,London Underground,Metropolitan;Piccadilly
+Ickenham,51.5615698,-0.4423513,station,subway,station,London Underground,Metropolitan;Piccadilly
+Pinner,51.5926589,-0.380635,station,subway,station,London Underground,Metropolitan
+Northwood Hills,51.6001534,-0.4084575,station,subway,station,London Underground,Metropolitan
+Northwood,51.6107965,-0.4237072,station,subway,station,London Underground,Metropolitan
+Croxley,51.6475825,-0.4410785,station,subway,station,London Underground,Metropolitan
+Watford,51.6570048,-0.4183683,station,subway,station,London Underground,Metropolitan
+Leytonstone,51.5688027,0.0086166,station,subway,station,London Underground,Central
+Harrow-on-the-Hill,51.5792702,-0.3366561,station,subway,station,National Rail;London Underground,Metropolitan
+Acton Town,51.5027051,-0.2799643,station,subway,station,London Underground,District;Piccadilly
+South Kensington,51.4940799,-0.1729072,station,subway,station,London Underground,Piccadilly;District;Circle
+Edgware Road,51.5204575,-0.1702993,station,subway,station,London Underground,Bakerloo
+Marylebone,51.5222363,-0.1635046,station,subway,station,London Underground,Bakerloo
+Embankment,51.5072143,-0.1222409,station,subway,station,London Underground,District;Bakerloo;Northern;Circle
+Notting Hill Gate,51.5089252,-0.1961978,station,subway,station,London Underground,District;Central;Circle
+West Ham,51.5280966,0.0045685,station,light_rail;subway,station,National Rail;London Underground;Docklands Light Railway,District;Hammersmith & City;Jubilee
+Stratford,51.541289,-0.0035472,station,light_rail;subway,station,National Rail;London Underground;London Overground;Docklands Light Railway;Elizabeth line,Central;Jubilee
+Southwark,51.503925,-0.1049663,station,subway,station,Elizabeth line,Jubilee
+Edgware,51.6136623,-0.2749555,station,subway,station,London Underground,Northern
+Kentish Town,51.5501727,-0.1388654,station,subway,station,National Rail;London Underground,Northern
+Warwick Avenue,51.5229834,-0.1833083,station,subway,station,London Underground,Bakerloo
+Tottenham Court Road,51.5159715,-0.1305125,station,subway,station,London Underground,Northern;Central
+Bounds Green,51.607376,-0.1249047,station,subway,station,London Underground,Piccadilly
+Hammersmith,51.494109,-0.2250607,station,subway,station,London Underground,Circle;Hammersmith & City
+St. Paul's,51.5149144,-0.0975883,station,subway,station,London Underground,Central
+Hampstead,51.5565973,-0.1784251,station,subway,station,London Underground,Northern
+Belsize Park,51.5503088,-0.1646146,station,subway,station,London Underground,Northern
+Holloway Road,51.5528674,-0.1130095,station,subway,station,London Underground,Piccadilly
+Swiss Cottage,51.543722,-0.174982,station,subway,station,London Underground,Jubilee
+Park Royal,51.5264341,-0.2839348,station,subway,station,London Underground,Piccadilly
+Wood Lane,51.5101068,-0.2237557,station,subway,station,London Underground,Hammersmith & City;Circle
+Turnpike Lane,51.5901482,-0.1027442,station,subway,station,London Underground,Piccadilly
+Morden,51.4027615,-0.1947552,station,subway,station,London Underground,Northern
+Canning Town,51.5139887,0.0082987,station,light_rail;subway,station,London Underground;Docklands Light Railway,Jubilee
+Ealing Broadway,51.5149803,-0.3004067,station,subway,station,National Rail;London Underground;Elizabeth line,Central;District
+Russell Square,51.5230529,-0.1242529,station,subway,station,London Underground,Piccadilly
+Caledonian Road,51.548482,-0.1183585,station,subway,station,London Underground,Piccadilly
+Totteridge & Whetstone,51.6307163,-0.1791837,station,subway,station,London Underground,Northern
+Chalk Farm,51.5441141,-0.1534811,station,subway,station,London Underground,Northern
+Oxford Circus,51.5154418,-0.1419563,station,subway,station,London Underground,Central;Bakerloo;Victoria
+North Greenwich,51.500574,0.0043201,station,subway,station,London Underground,Jubilee
+Canada Water,51.4979299,-0.0498405,station,subway,station,London Underground;London Overground,Jubilee
+Moorgate,51.5182516,-0.0890625,station,subway,station,National Rail;London Underground,Metropolitan;Northern;Circle;Hammersmith & City
+Kensington (Olympia),51.497437,-0.2094954,station,subway,station,National Rail;London Underground;London Overground,District
+South Ruislip,51.5569909,-0.3990635,station,subway,station,National Rail;London Underground,Central
+North Acton,51.5235769,-0.2597818,station,subway,station,London Underground,Central
+Hammersmith,51.4921398,-0.2233005,station,subway,station,London Underground,Piccadilly;District
+Tower Hill,51.5098481,-0.0766986,station,subway,station,London Underground,District;Circle
+Colindale,51.5954091,-0.2499296,station,subway,station,London Underground,Northern
+Golders Green,51.5723003,-0.194027,station,subway,station,London Underground,Northern
+Ruislip,51.5714026,-0.4213375,station,subway,station,London Underground,Metropolitan;Piccadilly
+Rayners Lane,51.5752109,-0.3714658,station,subway,station,London Underground,Metropolitan;Piccadilly
+Neasden,51.5543358,-0.250749,station,subway,station,London Underground,Jubilee
+Hatton Cross,51.4665357,-0.4239942,station,subway,station,Elizabeth line,Piccadilly
+Osterley,51.4815507,-0.3518348,station,subway,station,London Underground,Piccadilly
+Stamford Brook,51.4949692,-0.2458881,station,subway,station,London Underground,District
+Turnham Green,51.4951314,-0.2546948,station,subway,station,London Underground,District;Piccadilly
+Chiswick Park,51.4945622,-0.2678739,station,subway,station,London Underground,District
+Earl's Court,51.4916123,-0.193903,station,subway,station,London Underground,District;Piccadilly
+Becontree,51.5403111,0.1265241,station,subway,station,London Underground,District
+Ruislip Manor,51.5733973,-0.4117997,station,subway,station,London Underground,Metropolitan;Piccadilly
+Northolt,51.5484582,-0.3695247,station,subway,station,London Underground,Central
+Perivale,51.5364952,-0.3225887,station,subway,station,London Underground,Central
+Theydon Bois,51.6717759,0.1033213,station,subway,station,London Underground,Central
+Loughton,51.6412266,0.0553234,station,subway,station,London Underground,Central
+Woodford,51.6068074,0.0340219,station,subway,station,London Underground,Central
+Hanger Lane,51.5303098,-0.2936453,station,subway,station,London Underground,Central
+Upminster Bridge,51.5582655,0.2347689,station,subway,station,London Underground,District
+Hornchurch,51.5538747,0.2181092,station,subway,station,London Underground,District
+Dagenham East,51.544018,0.1649496,station,subway,station,London Underground,District
+Dagenham Heathway,51.5415534,0.1456377,station,subway,station,London Underground,District
+Stanmore,51.6188526,-0.3026271,station,subway,station,London Underground,Jubilee
+Canons Park,51.6080065,-0.2947453,station,subway,station,London Underground,Jubilee
+Elm Park,51.549579,0.1974303,station,subway,station,London Underground,District
+Leyton,51.5568183,-0.0051322,station,subway,station,London Underground,Central
+East Putney,51.4586138,-0.2112429,station,subway,station,London Underground,District
+Temple,51.5109659,-0.1143345,station,subway,station,London Underground,District;Circle
+Walthamstow Central,51.582893,-0.0199941,station,subway,station,London Underground;London Overground,Victoria
+Alperton,51.5408036,-0.3000963,station,subway,station,London Underground,Piccadilly
+Covent Garden,51.5130942,-0.1242695,station,subway,station,London Underground,Piccadilly
+St. John's Wood,51.5353523,-0.1742097,station,subway,station,London Underground,Jubilee
+East Ham,51.5394005,0.0526042,station,subway,station,London Underground,District;Hammersmith & City
+Bromley-by-Bow,51.5246287,-0.0123189,station,subway,station,London Underground,District;Hammersmith & City
+Canary Wharf,51.5035036,-0.0186272,station,subway,station,London Underground,Jubilee
+Kensal Green,51.5306063,-0.2244449,station,subway,station,National Rail;London Underground;London Overground,Bakerloo
+Harlesden,51.5363567,-0.257833,station,subway,station,London Underground;London Overground,Bakerloo
+West Hampstead,51.5468194,-0.1899646,station,subway,station,London Underground,Jubilee
+Bermondsey,51.4977004,-0.0643453,station,subway,station,London Underground,Jubilee
+Green Park,51.5066192,-0.1429113,station,subway,station,Elizabeth line,Piccadilly;Victoria;Jubilee
+Uxbridge,51.546655,-0.4775114,station,subway,station,London Underground,Metropolitan;Piccadilly
+Hillingdon,51.5536028,-0.4504637,station,subway,station,London Underground,Metropolitan;Piccadilly
+Goldhawk Road,51.5017564,-0.2265662,station,subway,station,London Underground,Circle;Hammersmith & City
+Shepherd's Bush,51.5043576,-0.2183251,station,subway,station,London Underground,Central
+Latimer Road,51.5134749,-0.2177873,station,subway,station,London Underground,Hammersmith & City;Circle
+Kilburn Park,51.5350704,-0.1943721,station,subway,station,London Underground,Bakerloo
+Royal Oak,51.5190222,-0.1874439,station,subway,station,London Underground,Circle;Hammersmith & City
+Bayswater,51.5122764,-0.1883854,station,subway,station,London Underground,Circle;District
+High Street Kensington,51.5002995,-0.1921096,station,subway,station,London Underground,Circle;District
+Gloucester Road,51.4945266,-0.1837696,station,subway,station,London Underground,Circle;District;Piccadilly
+Marble Arch,51.513435,-0.1582531,station,subway,station,London Underground,Central
+Great Portland Street,51.5238146,-0.1437048,station,subway,station,London Underground,Circle;Metropolitan;Hammersmith & City
+Warren Street,51.5247178,-0.1385303,station,subway,station,London Underground,Northern;Victoria
+Goodge Street,51.5205978,-0.1343573,station,subway,station,London Underground,Northern
+Highbury & Islington,51.5463679,-0.1036544,station,subway,station,National Rail;London Underground;London Overground,Mildmay;Victoria;Windrush;Great Northern
+Willesden Green,51.5493524,-0.222223,station,subway,station,London Underground,Jubilee
+Kilburn,51.5469889,-0.2053385,station,subway,station,London Underground,Jubilee
+West Acton,51.5183524,-0.280413,station,subway,station,London Underground,Central
+Richmond,51.4632072,-0.3004127,station,subway,station,National Rail;London Underground;London Overground,District
+Gunnersbury,51.4913757,-0.2755244,station,subway,station,London Underground;London Overground,District
+Stonebridge Park,51.5441099,-0.2762285,station,subway,station,London Underground;London Overground,Bakerloo
+Willesden Junction,51.5321956,-0.2435041,station,train;subway,station,London Underground;London Overground,Bakerloo;Mildmay;Lioness
+Dollis Hill,51.5519333,-0.2390026,station,subway,station,London Underground,Jubilee
+Westbourne Park,51.5209265,-0.2014098,station,subway,station,London Underground,Hammersmith & City;Circle
+Kew Gardens,51.4771341,-0.284962,station,subway,station,London Underground;London Overground,District
+Barking,51.5402677,0.0793235,station,subway,station,National Rail;London Underground;London Overground,District;Hammersmith & City
+Ladbroke Grove,51.5172639,-0.2111019,station,subway,station,London Underground,Circle;Hammersmith & City
+Upney,51.538266,0.099626,station,subway,station,London Underground,District
+Queen's Park,51.533873,-0.2054958,station,subway,station,London Underground;London Overground,Bakerloo
+Tottenham Hale,51.588123,-0.0599442,station,subway,station,National Rail;London Underground,Victoria
+Holland Park,51.5071908,-0.2055243,station,subway,station,London Underground,Central
+Euston Square,51.5256866,-0.1355703,station,subway,station,London Underground,Metropolitan;Circle;Hammersmith & City
+Wanstead,51.575646,0.0286373,station,subway,station,London Underground,Central
+Queensway,51.5104729,-0.1872329,station,subway,station,London Underground,Central
+Regent's Park,51.5236277,-0.1466357,station,subway,station,London Underground,Bakerloo
+Maida Vale,51.5297928,-0.1857906,station,subway,station,London Underground,Bakerloo
+Wood Green,51.597416,-0.1097795,station,subway,station,London Underground,Piccadilly
+Manor House,51.5703208,-0.0963971,station,subway,station,London Underground,Piccadilly
+Borough,51.5011444,-0.0932926,station,subway,station,London Underground,Northern
+Bethnal Green,51.5272449,-0.054752,station,subway,station,London Underground,Central
+Wembley Central,51.5523278,-0.2966751,station,subway,station,National Rail;London Underground;London Overground,Bakerloo
+Nine Elms,51.4801837,-0.1296937,station,subway,station,London Underground,Northern
+Battersea Power Station,51.4796154,-0.1429709,station,subway,station,London Underground,Northern
+Bond Street,51.5135348,-0.1470905,station,,station,Elizabeth line,
