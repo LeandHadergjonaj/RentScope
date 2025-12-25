@@ -1,14 +1,62 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import os
 import math
 import re
+import json
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
+from collections import Counter
+import pickle
+import io
+import base64
+from openai import OpenAI
+import numpy as np
+
+# Try to import scipy for fast nearest neighbor lookup
+try:
+    from scipy.spatial import cKDTree
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    cKDTree = None
+import numpy as np
+
+# Try to import scipy for fast nearest neighbor lookup
+try:
+    from scipy.spatial import cKDTree
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    cKDTree = None
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed, continue without it
+    pass
 
 app = FastAPI()
+
+# Feature flags and configuration
+ENABLE_PORTAL_ASSETS = os.getenv("ENABLE_PORTAL_ASSETS", "false").lower() == "true"
+ENABLE_GEOCODING = os.getenv("ENABLE_GEOCODING", "false").lower() == "true"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+openai_client: Optional[OpenAI] = None
+
+if ENABLE_PORTAL_ASSETS:
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY is required when ENABLE_PORTAL_ASSETS=true. Please set it in backend/.env file.")
+    else:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        print("Portal assets analysis enabled (OpenAI configured)")
 
 # CORS configuration: localhost and 127.0.0.1 are treated as different origins by browsers
 app.add_middleware(
@@ -24,6 +72,15 @@ ons_data: Optional[pd.DataFrame] = None
 postcode_data: Optional[pd.DataFrame] = None
 tfl_stations_data: Optional[pd.DataFrame] = None
 comps_data: Optional[pd.DataFrame] = None
+valid_postcodes: set = set()  # Fast lookup for valid postcodes (normalized with space)
+valid_postcode_nospace: set = set()  # Fast lookup for valid postcodes (no space)
+# Nearest postcode lookup (A)
+postcode_kdtree: Optional[Any] = None  # cKDTree or None
+postcode_coords: Optional[np.ndarray] = None  # Array of (lat, lon) for all postcodes
+postcode_lookup_data: Optional[pd.DataFrame] = None  # DataFrame with postcode, ladcd, lat, lon for each point
+ml_model: Optional[Any] = None  # ML model pipeline (includes preprocessor)
+ml_enabled: bool = False
+ml_mae: float = 0.0
 
 # Bedroom multipliers
 BEDROOM_MULTIPLIERS = {
@@ -250,10 +307,342 @@ def compute_comps_estimate(comps_df: pd.DataFrame) -> Tuple[float, List[float]]:
     
     return expected_median, [expected_lower, expected_upper]
 
+# --- Nearest Postcode Lookup (A) ---
+def build_postcode_kdtree(postcode_df: pd.DataFrame) -> Tuple[Optional[Any], Optional[np.ndarray], Optional[pd.DataFrame]]:
+    """Build a fast nearest-neighbor index for postcode lookup from lat/lon."""
+    try:
+        # Filter to rows with valid lat/lon
+        valid_mask = postcode_df['lat'].notna() & postcode_df['lon'].notna()
+        valid_df = postcode_df[valid_mask].copy()
+        
+        if len(valid_df) == 0:
+            return None, None, None
+        
+        # Extract coordinates as numpy array
+        coords = valid_df[['lat', 'lon']].values.astype(np.float64)
+        
+        # Build KDTree if scipy available, otherwise return data for vectorized search
+        kdtree = None
+        if SCIPY_AVAILABLE and cKDTree is not None:
+            kdtree = cKDTree(coords)
+        
+        # Store lookup data (postcode, ladcd, lat, lon)
+        lookup_data = valid_df[['postcode', 'ladcd', 'lat', 'lon']].copy()
+        if 'postcode_nospace' in valid_df.columns:
+            lookup_data['postcode_nospace'] = valid_df['postcode_nospace']
+        
+        return kdtree, coords, lookup_data
+    except Exception as e:
+        print(f"Warning: Could not build postcode KDTree: {e}")
+        return None, None, None
+
+# --- Address/Postcode Resolution (A) ---
+def resolve_location_from_listing(
+    url: str,
+    parsed_address_text: Optional[str],
+    extracted_lat: Optional[float],
+    extracted_lon: Optional[float]
+) -> Dict[str, Any]:
+    """
+    Resolve location (lat, lon, postcode) from listing using priority order:
+    1) Extracted lat/lon from listing
+    2) OpenStreetMap Nominatim geocoding from address text
+    3) None
+    
+    Returns dict with: lat, lon, postcode, postcode_valid, location_source, location_precision_m, warnings
+    """
+    result = {
+        'lat': None,
+        'lon': None,
+        'postcode': None,
+        'postcode_valid': False,
+        'location_source': 'none',
+        'location_precision_m': None,
+        'warnings': []
+    }
+    
+    # Priority 1: If lat/lon extracted from listing, infer postcode
+    if extracted_lat is not None and extracted_lon is not None:
+        inferred_result = infer_postcode_from_latlon(extracted_lat, extracted_lon)
+        if inferred_result and inferred_result.get('postcode'):
+            result['lat'] = extracted_lat
+            result['lon'] = extracted_lon
+            result['postcode'] = inferred_result['postcode']
+            result['postcode_valid'] = True
+            result['location_source'] = 'listing_latlon'
+            result['location_precision_m'] = inferred_result.get('dist_m')
+            if result['location_precision_m'] and result['location_precision_m'] > 500:
+                result['warnings'].append(f"Postcode inferred from coordinates ({result['location_precision_m']:.0f}m from nearest)")
+        else:
+            result['lat'] = extracted_lat
+            result['lon'] = extracted_lon
+            result['location_source'] = 'listing_latlon'
+            result['warnings'].append("Could not infer postcode from extracted coordinates")
+        return result
+    
+    # Priority 2: OpenStreetMap Nominatim geocoding from address text
+    if ENABLE_GEOCODING and parsed_address_text and parsed_address_text.strip():
+        try:
+            # Add "London, UK" context if not present
+            address_query = parsed_address_text.strip()
+            if 'london' not in address_query.lower():
+                address_query = f"{address_query}, London, UK"
+            
+            headers = {
+                'User-Agent': 'RentScope/1.0 (Property Evaluation Tool; contact@rentscope.example.com)'
+            }
+            
+            nominatim_url = "https://nominatim.openstreetmap.org/search"
+            params = {
+                'q': address_query,
+                'format': 'json',
+                'addressdetails': 1,
+                'limit': 1,
+                'countrycodes': 'gb'  # UK only
+            }
+            
+            response = requests.get(nominatim_url, params=params, headers=headers, timeout=8)
+            response.raise_for_status()
+            
+            data = response.json()
+            if data and len(data) > 0:
+                first_result = data[0]
+                
+                # Extract lat/lon
+                result['lat'] = float(first_result.get('lat', 0))
+                result['lon'] = float(first_result.get('lon', 0))
+                
+                # Extract postcode from address details
+                address_details = first_result.get('address', {})
+                postcode_raw = (
+                    address_details.get('postcode') or
+                    address_details.get('postal_code')
+                )
+                
+                if postcode_raw:
+                    # Normalize and validate postcode
+                    postcode_normalized = normalize_postcode(str(postcode_raw))
+                    if validate_postcode_candidate(postcode_normalized):
+                        result['postcode'] = postcode_normalized
+                        result['postcode_valid'] = True
+                    else:
+                        result['warnings'].append(f"Geocoded postcode '{postcode_raw}' not found in lookup")
+                
+                # If postcode missing, infer from lat/lon
+                if not result['postcode']:
+                    inferred_result = infer_postcode_from_latlon(result['lat'], result['lon'])
+                    if inferred_result and inferred_result.get('postcode'):
+                        result['postcode'] = inferred_result['postcode']
+                        result['postcode_valid'] = True
+                        result['location_precision_m'] = inferred_result.get('dist_m')
+                        if result['location_precision_m'] and result['location_precision_m'] > 500:
+                            result['warnings'].append(f"Postcode inferred from geocoded coordinates ({result['location_precision_m']:.0f}m from nearest)")
+                    else:
+                        result['warnings'].append("Could not infer postcode from geocoded coordinates")
+                
+                result['location_source'] = 'nominatim'
+            else:
+                result['warnings'].append(f"No geocoding results for address: {parsed_address_text}")
+        except requests.RequestException as e:
+            result['warnings'].append(f"Geocoding request failed: {str(e)}")
+        except Exception as e:
+            result['warnings'].append(f"Geocoding error: {str(e)}")
+    
+    return result
+
+def infer_postcode_from_latlon(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    """
+    Infer nearest postcode from lat/lon coordinates.
+    Returns {postcode, ladcd, dist_m} or None if lookup unavailable.
+    """
+    global postcode_kdtree, postcode_coords, postcode_lookup_data
+    
+    if postcode_lookup_data is None or postcode_coords is None:
+        return None
+    
+    try:
+        query_point = np.array([[lat, lon]], dtype=np.float64)
+        
+        if SCIPY_AVAILABLE and postcode_kdtree is not None:
+            # Use KDTree for fast lookup
+            dist, idx = postcode_kdtree.query(query_point, k=1)
+            dist_m = float(dist[0] * 111000)  # Rough conversion: 1 degree ≈ 111km
+            nearest_idx = int(idx[0])
+        else:
+            # Vectorized nearest search (fallback)
+            distances = np.sqrt(
+                np.sum((postcode_coords - query_point) ** 2, axis=1)
+            )
+            nearest_idx = int(np.argmin(distances))
+            # Convert to meters (rough approximation)
+            dist_deg = float(distances[nearest_idx])
+            dist_m = dist_deg * 111000
+        
+        # Get postcode and ladcd from lookup data
+        nearest_row = postcode_lookup_data.iloc[nearest_idx]
+        postcode = str(nearest_row['postcode']).strip() if pd.notna(nearest_row['postcode']) else None
+        ladcd = str(nearest_row['ladcd']).strip() if pd.notna(nearest_row['ladcd']) else None
+        
+        return {
+            'postcode': normalize_postcode(postcode) if postcode else None,
+            'ladcd': ladcd,
+            'dist_m': dist_m
+        }
+    except Exception as e:
+        print(f"Warning: Error inferring postcode from lat/lon: {e}")
+        return None
+
+def normalize_postcode(postcode: str) -> str:
+    """Normalize postcode to standard format: uppercase, single space before last 3 chars"""
+    if not postcode:
+        return ""
+    # Remove all spaces and convert to uppercase
+    clean = postcode.replace(" ", "").upper()
+    if len(clean) >= 5:
+        # Insert space before last 3 characters
+        return clean[:-3] + " " + clean[-3:]
+    return clean
+
+def train_ml_model(comps_df: pd.DataFrame) -> Tuple[Optional[Any], Optional[Any], bool, float]:
+    """
+    Train Ridge regression model on comparables data using sklearn Pipeline.
+    Returns (model_pipeline, None, enabled, mae)
+    """
+    try:
+        from sklearn.linear_model import Ridge
+        from sklearn.preprocessing import OneHotEncoder
+        from sklearn.compose import ColumnTransformer
+        from sklearn.pipeline import Pipeline
+        from sklearn.impute import SimpleImputer
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import mean_absolute_error
+        
+        if len(comps_df) < 2000:
+            return None, None, False, 0.0
+        
+        # Prepare features
+        df = comps_df.copy()
+        
+        # Fill missing values for required columns
+        df['bathrooms'] = df.get('bathrooms', pd.Series([1] * len(df))).fillna(1)
+        if 'floor_area_sqm' in df.columns:
+            df['floor_area_sqm'] = df['floor_area_sqm'].fillna(df['floor_area_sqm'].median())
+        else:
+            df['floor_area_sqm'] = 50.0  # Default
+        
+        # Compute distance to nearest station for each comp
+        if tfl_stations_data is not None and len(tfl_stations_data) > 0:
+            def get_nearest_station_distance(lat, lon):
+                if pd.isna(lat) or pd.isna(lon):
+                    return 1500.0  # Default
+                min_dist = float('inf')
+                for _, station in tfl_stations_data.iterrows():
+                    dist = haversine_distance(lat, lon, station['lat'], station['lon'])
+                    if dist < min_dist:
+                        min_dist = dist
+                return min_dist if min_dist != float('inf') else 1500.0
+            df['nearest_station_distance_m'] = df.apply(
+                lambda row: get_nearest_station_distance(row['lat'], row['lon']), axis=1
+            )
+        else:
+            df['nearest_station_distance_m'] = 1500.0  # Default
+        
+        # Derive postcode_district and ladcd from postcode if available (7)
+        if 'postcode' in df.columns and df['postcode'].notna().any():
+            # Extract district from postcode
+            df['postcode_district'] = df['postcode'].apply(
+                lambda x: str(x).split()[0].upper() if pd.notna(x) and " " in str(x) else 
+                (str(x)[:4].upper() if pd.notna(x) and len(str(x)) >= 2 else "UNKNOWN")
+            )
+            # Try to get ladcd from postcode lookup
+            if postcode_data is not None and 'ladcd' in postcode_data.columns and 'postcode' in postcode_data.columns:
+                postcode_to_ladcd = dict(zip(postcode_data['postcode'].astype(str).str.upper(), postcode_data['ladcd'].astype(str)))
+                df['ladcd'] = df['postcode'].apply(
+                    lambda x: postcode_to_ladcd.get(str(x).upper().strip(), "UNKNOWN") if pd.notna(x) else "UNKNOWN"
+                )
+            else:
+                df['ladcd'] = "UNKNOWN"
+        elif 'postcode_district' in df.columns:
+            # Use existing postcode_district if present
+            df['postcode_district'] = df['postcode_district'].fillna("UNKNOWN")
+            df['ladcd'] = "UNKNOWN"
+        else:
+            # Infer from lat/lon using nearest postcode lookup
+            df['postcode_district'] = "UNKNOWN"  # Fallback
+            df['ladcd'] = "UNKNOWN"
+        
+        # Ensure lat/lon are present
+        if 'lat' not in df.columns:
+            df['lat'] = 51.5074  # London default
+        if 'lon' not in df.columns:
+            df['lon'] = -0.1278  # London default
+        
+        # Add interaction feature: bedrooms * floor_area_sqm (7)
+        df['bedrooms_floor_area'] = df['bedrooms'] * df['floor_area_sqm']
+        
+        # Define feature columns (7)
+        numeric_features = ["bedrooms", "bathrooms", "floor_area_sqm", "nearest_station_distance_m", "lat", "lon", "bedrooms_floor_area"]
+        categorical_features = ["property_type", "postcode_district", "ladcd"]
+        
+        # Ensure all required columns exist
+        for col in numeric_features + categorical_features:
+            if col not in df.columns:
+                if col in numeric_features:
+                    df[col] = 0.0 if col in ["lat", "lon"] else 1.0
+                else:
+                    df[col] = "UNKNOWN"
+        
+        # Build preprocessor (3)
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ("num", Pipeline(steps=[
+                    ("imputer", SimpleImputer(strategy="median"))
+                ]), numeric_features),
+                ("cat", Pipeline(steps=[
+                    ("imputer", SimpleImputer(strategy="most_frequent")),
+                    ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+                ]), categorical_features),
+            ],
+            remainder="drop"
+        )
+        
+        # Build model pipeline (4)
+        ml_model = Pipeline(steps=[
+            ("preprocess", preprocessor),
+            ("ridge", Ridge(alpha=1.0, random_state=42))
+        ])
+        
+        # Prepare X and y
+        X = df[numeric_features + categorical_features].copy()
+        y = df['price_pcm'].values
+        
+        # Train/test split (5)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        # Train model
+        ml_model.fit(X_train, y_train)
+        
+        # Evaluate
+        y_pred = ml_model.predict(X_test)
+        mae = mean_absolute_error(y_test, y_pred)
+        
+        print(f"ML model trained: MAE = £{mae:.2f}/month")
+        return ml_model, None, True, mae  # Return pipeline, not separate model/preprocessor
+        
+    except ImportError:
+        print("Warning: scikit-learn not available, ML model disabled")
+        return None, None, False, 0.0
+    except Exception as e:
+        print(f"Warning: ML model training failed: {e}")
+        return None, None, False, 0.0
+
 @app.on_event("startup")
 async def load_data():
     """Load CSV files at startup"""
     global ons_data, postcode_data, tfl_stations_data, comps_data
+    global valid_postcodes, valid_postcode_nospace
+    global postcode_kdtree, postcode_coords, postcode_lookup_data
+    global ml_model, ml_enabled, ml_mae
     
     data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
     
@@ -265,6 +654,32 @@ async def load_data():
         print(f"Loaded ONS data: {len(ons_data)} rows")
         print(f"Loaded postcode data: {len(postcode_data)} rows")
         print(f"Loaded TFL stations data: {len(tfl_stations_data)} rows")
+        
+        # Build postcode lookup sets
+        if 'postcode' in postcode_data.columns:
+            valid_postcodes = set()
+            valid_postcode_nospace = set()
+            for pc in postcode_data['postcode'].dropna():
+                pc_str = str(pc).strip().upper()
+                normalized = normalize_postcode(pc_str)
+                # Add normalized (with space) and nospace versions
+                valid_postcodes.add(normalized)
+                valid_postcode_nospace.add(normalized.replace(" ", ""))
+            # Also add from postcode_nospace column if it exists
+            if 'postcode_nospace' in postcode_data.columns:
+                for pc in postcode_data['postcode_nospace'].dropna():
+                    pc_str = str(pc).strip().upper()
+                    normalized = normalize_postcode(pc_str)
+                    valid_postcodes.add(normalized)
+                    valid_postcode_nospace.add(normalized.replace(" ", ""))
+            print(f"Built postcode lookup sets: {len(valid_postcodes)} normalized, {len(valid_postcode_nospace)} nospace entries")
+        
+        # Build nearest postcode lookup (A)
+        postcode_kdtree, postcode_coords, postcode_lookup_data = build_postcode_kdtree(postcode_data)
+        if postcode_kdtree is not None or postcode_coords is not None:
+            print(f"Built postcode KDTree: {len(postcode_coords) if postcode_coords is not None else 0} points")
+        else:
+            print("Warning: Postcode KDTree not available (will use vectorized search)")
         
         # Load comparables if available
         comps_path = os.path.join(data_dir, "comparables.csv")
@@ -279,6 +694,8 @@ async def load_data():
                     comps_data = None
                 else:
                     print(f"Loaded comparables: {len(comps_data)} rows")
+                    # Train ML model if enough data
+                    ml_model, _, ml_enabled, ml_mae = train_ml_model(comps_data)
             except Exception as e:
                 print(f"Warning: Could not load comparables.csv: {e}")
                 comps_data = None
@@ -290,22 +707,76 @@ async def load_data():
         raise
 
 # Request/Response models
+class ParseListingRequest(BaseModel):
+    url: str
+
+class PostcodeCandidate(BaseModel):
+    value: str
+    source: str  # "jsonld" | "script" | "regex"
+    valid: bool
+
+class ParseListingResponse(BaseModel):
+    price_pcm: Optional[float] = None
+    bedrooms: Optional[int] = None
+    property_type: Optional[str] = None
+    postcode: Optional[str] = None
+    postcode_valid: bool = False
+    postcode_source: str = "unknown"  # "jsonld" | "script" | "regex" | "unknown"
+    postcode_candidates: List[PostcodeCandidate] = []
+    chosen_postcode_source: str = "unknown"
+    bathrooms: Optional[int] = None
+    floor_area_sqm: Optional[float] = None
+    furnished: Optional[str] = None  # "true" | "false" | "unknown" | None
+    parsing_confidence: str = "low"  # "high" | "medium" | "low"
+    extracted_fields: List[str] = []
+    warnings: List[str] = []
+    # Portal assets (B)
+    image_urls: List[str] = []
+    floorplan_url: Optional[str] = None
+    asset_warnings: List[str] = []
+    asset_extraction_confidence: str = "low"  # "high" | "medium" | "low"
+    # Location extraction (B)
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    location_source: str = "none"  # "jsonld" | "script" | "html" | "listing_latlon" | "nominatim" | "inferred" | "none"
+    inferred_postcode: Optional[str] = None
+    inferred_postcode_distance_m: Optional[float] = None
+    address_text: Optional[str] = None  # Best-effort extracted address text (B)
+    location_precision_m: Optional[float] = None  # Distance to inferred postcode if used (B)
+
 class EvaluateRequest(BaseModel):
     url: str = ""
     price_pcm: float
     bedrooms: int
     property_type: str  # "flat|house|studio|room"
-    postcode: str
+    postcode: Optional[str] = None  # Optional - can infer from lat/lon
     bathrooms: Optional[int] = None
     floor_area_sqm: Optional[float] = None
     furnished: Optional[bool] = None
     quality: Optional[str] = "average"  # "dated", "average", "modern"
+    # Portal assets (D)
+    photo_condition_label: Optional[str] = None  # "dated" | "average" | "modern" | "luxury"
+    photo_condition_score: Optional[int] = None  # 0-100
+    photo_condition_confidence: Optional[str] = None  # "low" | "medium" | "high"
+    floorplan_area_sqm: Optional[float] = None
+    floorplan_confidence: Optional[str] = None  # "low" | "medium" | "high"
+    # Location (C)
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+
+class DebugInfo(BaseModel):
+    estimate_quality_score: int
+    quality_label: str  # "poor"|"ok"|"good"|"great"
+    quality_reasons: List[str]
+    model_components: Dict[str, Any]
 
 class EvaluateResponse(BaseModel):
     borough: str
     listed_price_pcm: float
     expected_median_pcm: float
-    expected_range_pcm: List[float]
+    expected_range_pcm: List[float]  # Wide statistical range (quartiles/IQR)
+    most_likely_range_pcm: Optional[List[float]] = None  # Tight range when evidence supports (C)
+    most_likely_range_basis: Optional[str] = None  # Explanation of range basis
     deviation_pct: float
     classification: str  # "undervalued|fair|overvalued"
     confidence: str  # "low|medium|high"
@@ -325,6 +796,170 @@ class EvaluateResponse(BaseModel):
     adaptive_radius_used: bool
     strong_similarity: bool
     similarity_dampening_factor: float
+    ml_expected_median_pcm: Optional[float] = None
+    # Portal assets (D)
+    photo_adjustment_pct: float = 0.0
+    floorplan_used: bool = False
+    floorplan_area_sqm_used: Optional[float] = None
+    area_used: bool = False
+    area_source: str = "none"  # "floorplan" | "none"
+    area_used_sqm: Optional[float] = None
+    debug: DebugInfo
+
+def compute_ml_prediction(
+    bedrooms: int,
+    bathrooms: Optional[int],
+    floor_area_sqm: Optional[float],
+    property_type: str,
+    distance_to_station_m: float,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    postcode_district: Optional[str] = None,
+    ladcd: Optional[str] = None
+) -> Optional[float]:
+    """Compute ML prediction for expected rent using sklearn Pipeline."""
+    if not ml_enabled or ml_model is None:
+        return None
+    
+    try:
+        # Prepare feature values (7)
+        bathrooms_val = bathrooms if bathrooms is not None else 1
+        floor_area_val = floor_area_sqm if floor_area_sqm is not None else 50.0
+        lat_val = lat if lat is not None else 51.5074  # London default
+        lon_val = lon if lon is not None else -0.1278  # London default
+        postcode_district_val = postcode_district if postcode_district else "UNKNOWN"
+        ladcd_val = ladcd if ladcd else "UNKNOWN"
+        
+        # Add interaction feature: bedrooms * floor_area_sqm (7)
+        bedrooms_floor_area = bedrooms * floor_area_val
+        
+        # Create single-row DataFrame with EXACT columns matching training (7)
+        numeric_features = ["bedrooms", "bathrooms", "floor_area_sqm", "nearest_station_distance_m", "lat", "lon", "bedrooms_floor_area"]
+        categorical_features = ["property_type", "postcode_district", "ladcd"]
+        
+        df_row = pd.DataFrame([{
+            'bedrooms': bedrooms,
+            'bathrooms': bathrooms_val,
+            'floor_area_sqm': floor_area_val,
+            'nearest_station_distance_m': distance_to_station_m,
+            'lat': lat_val,
+            'lon': lon_val,
+            'bedrooms_floor_area': bedrooms_floor_area,
+            'property_type': property_type,
+            'postcode_district': postcode_district_val,
+            'ladcd': ladcd_val
+        }], columns=numeric_features + categorical_features)
+        
+        # Predict directly using pipeline (6)
+        prediction = ml_model.predict(df_row)[0]
+        
+        if ml_enabled:
+            print("ML prediction ok")
+        
+        return max(0.0, float(prediction))
+    except Exception as e:
+        print(f"ML prediction error: {e}")
+        return None
+
+def create_default_debug_info() -> DebugInfo:
+    """Create default debug info for error cases."""
+    return DebugInfo(
+        estimate_quality_score=0,
+        quality_label="poor",
+        quality_reasons=["Insufficient data for evaluation"],
+        model_components={
+            "ons_used": False,
+            "comps_used": False,
+            "ml_used": False,
+            "comps_sample_size": 0,
+            "comps_radius_m": 0.0,
+            "strong_similarity": False,
+            "ml_mae": None,
+            "ml_expected_median_pcm": None,
+            "portal_assets_used": False,
+            "photos_used": 0,
+            "floorplan_used": False
+        }
+    )
+
+def compute_estimate_quality_score(
+    comps_used: bool,
+    comps_sample_size: int,
+    comps_radius_m: float,
+    strong_similarity: bool,
+    confidence: str,
+    structural_divergence_triggered: bool,
+    ons_used: bool,
+    ml_used: bool,
+    ml_mae: Optional[float] = None,
+    postcode_inferred: bool = False,
+    inferred_postcode_dist_m: Optional[float] = None
+) -> Tuple[int, str, List[str]]:
+    """
+    Compute estimate quality score heuristically.
+    Returns (score, label, reasons)
+    """
+    score = 50  # Start at 50
+    reasons = []
+    
+    # Positive factors
+    if comps_used and comps_sample_size >= 15:
+        score += 15
+        reasons.append(f"+15: Comparables used with {comps_sample_size} samples (>=15)")
+    
+    if comps_radius_m <= 1200:
+        score += 10
+        reasons.append(f"+10: Comparables radius {comps_radius_m:.0f}m (<=1200m)")
+    
+    if strong_similarity:
+        score += 10
+        reasons.append("+10: Strong similarity detected (exact bedroom match, close radius, sufficient comps)")
+    
+    if ml_used and ml_mae is not None:
+        score += 10
+        reasons.append(f"+10: ML model used (MAE: £{ml_mae:.2f}/month)")
+    
+    if postcode_inferred and inferred_postcode_dist_m is not None and inferred_postcode_dist_m <= 500:
+        score += 10
+        reasons.append(f"+10: Postcode inferred from coordinates (distance: {inferred_postcode_dist_m:.0f}m, reliable)")
+    
+    if confidence == "high":
+        score += 5
+        reasons.append("+5: High confidence")
+    elif confidence == "medium":
+        reasons.append("+0: Medium confidence")
+    
+    # Negative factors
+    if confidence == "low":
+        score -= 10
+        reasons.append("-10: Low confidence")
+    
+    if comps_sample_size < 10 and comps_used:
+        score -= 10
+        reasons.append(f"-10: Comparables sample size {comps_sample_size} (<10)")
+    
+    if comps_radius_m > 1200 and comps_used:
+        score -= 10
+        reasons.append(f"-10: Comparables radius {comps_radius_m:.0f}m (>1200m)")
+    
+    if structural_divergence_triggered:
+        score -= 10
+        reasons.append("-10: Structural divergence triggered (large ONS/comps mismatch)")
+    
+    # Clamp to [0, 100]
+    score = max(0, min(100, score))
+    
+    # Determine label
+    if score <= 39:
+        label = "poor"
+    elif score <= 59:
+        label = "ok"
+    elif score <= 79:
+        label = "good"
+    else:
+        label = "great"
+    
+    return score, label, reasons
 
 @app.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate_property(request: EvaluateRequest):
@@ -333,61 +968,108 @@ async def evaluate_property(request: EvaluateRequest):
     if ons_data is None or postcode_data is None:
         raise HTTPException(status_code=500, detail="Data not loaded")
     
-    # Step 1: postcode -> lat/lon using postcode_lookup_clean
-    postcode_normalized = request.postcode.replace(" ", "").upper()
-    postcode_row = postcode_data[
-        postcode_data["postcode_nospace"].str.upper() == postcode_normalized
-    ]
+    # Step 0: Strict area gating - only use floorplan area if confidence is sufficient (A)
+    area_used = False
+    area_used_sqm = None
+    area_source = "none"
+    floorplan_used = False
+    floorplan_area_sqm_used = None
     
-    if postcode_row.empty:
-        # Try with space
+    # Decide area usage strictly: only if floorplan qualifies
+    if request.floorplan_area_sqm and request.floorplan_area_sqm > 0 and request.floorplan_confidence in ["high", "medium"]:
+        area_used = True
+        area_used_sqm = float(request.floorplan_area_sqm)
+        area_source = "floorplan"
+        floorplan_used = True
+        floorplan_area_sqm_used = float(request.floorplan_area_sqm)
+    else:
+        # Ignore request.floor_area_sqm entirely - bedrooms-only mode
+        area_used = False
+        area_used_sqm = None
+        area_source = "none"
+        floorplan_used = False
+        floorplan_area_sqm_used = None
+    
+    # Step 1: Get lat/lon and postcode (C) - lat/lon-first approach
+    lat = None
+    lon = None
+    ladcd = None
+    postcode_inferred = False
+    inferred_postcode_dist_m = None
+    
+    # If lat/lon provided, use them directly
+    if request.lat is not None and request.lon is not None:
+        lat = float(request.lat)
+        lon = float(request.lon)
+        
+        # Infer postcode from lat/lon if postcode missing or invalid
+        if not request.postcode or not request.postcode.strip():
+            inferred_result = infer_postcode_from_latlon(lat, lon)
+            if inferred_result and inferred_result.get('postcode'):
+                request.postcode = inferred_result['postcode']
+                ladcd = inferred_result.get('ladcd')
+                postcode_inferred = True
+                inferred_postcode_dist_m = inferred_result.get('dist_m')
+            else:
+                raise HTTPException(status_code=400, detail="Could not infer postcode from coordinates — cannot evaluate.")
+        else:
+            # Validate postcode and get ladcd
+            postcode_normalized = request.postcode.replace(" ", "").upper()
+            postcode_row = postcode_data[
+                postcode_data["postcode_nospace"].str.upper() == postcode_normalized
+            ]
+            
+            if postcode_row.empty:
+                postcode_row = postcode_data[
+                    postcode_data["postcode"].str.upper() == request.postcode.upper()
+                ]
+            
+            if not postcode_row.empty:
+                ladcd = str(postcode_row.iloc[0]["ladcd"]).strip() if pd.notna(postcode_row.iloc[0]["ladcd"]) else None
+            else:
+                # Postcode not found, try to infer
+                inferred_result = infer_postcode_from_latlon(lat, lon)
+                if inferred_result and inferred_result.get('postcode'):
+                    request.postcode = inferred_result['postcode']
+                    ladcd = inferred_result.get('ladcd')
+                    postcode_inferred = True
+                    inferred_postcode_dist_m = inferred_result.get('dist_m')
+    
+    # If no lat/lon but postcode provided, lookup lat/lon from postcode
+    elif request.postcode and request.postcode.strip():
+        postcode_normalized = request.postcode.replace(" ", "").upper()
         postcode_row = postcode_data[
-            postcode_data["postcode"].str.upper() == request.postcode.upper()
+            postcode_data["postcode_nospace"].str.upper() == postcode_normalized
         ]
-    
-    if postcode_row.empty:
-        return EvaluateResponse(
-            borough="unknown",
-            listed_price_pcm=request.price_pcm,
-            expected_median_pcm=0.0,
-            expected_range_pcm=[0.0, 0.0],
-            deviation_pct=0.0,
-            classification="fair",
-            confidence="low",
-            explanations=["Postcode not found in database"],
-            nearest_station_distance_m=0.0,
-            transport_adjustment_pct=0.0,
-            used_borough_fallback=False,
-            extra_adjustment_pct=0.0,
-            adjustments_breakdown={"transport": 0.0, "furnished": 0.0, "bathrooms": 0.0, "size": 0.0, "quality": 0.0},
-            comps_used=False,
-            comps_sample_size=0,
-            comps_radius_m=0.0,
-            comps_expected_median_pcm=0.0,
-            comps_expected_range_pcm=[0.0, 0.0],
-            deviation_pct_damped=0.0,
-            confidence_adjusted=False,
-            adaptive_radius_used=False,
-            strong_similarity=False,
-            similarity_dampening_factor=0.0
-        )
-    
-    lat = postcode_row.iloc[0]["lat"]
-    lon = postcode_row.iloc[0]["lon"]
-    ladcd = postcode_row.iloc[0]["ladcd"]
+        
+        if postcode_row.empty:
+            postcode_row = postcode_data[
+                postcode_data["postcode"].str.upper() == request.postcode.upper()
+            ]
+        
+        if postcode_row.empty:
+            raise HTTPException(status_code=400, detail="Postcode not found / invalid — cannot evaluate.")
+        
+        lat = float(postcode_row.iloc[0]["lat"])
+        lon = float(postcode_row.iloc[0]["lon"])
+        ladcd = str(postcode_row.iloc[0]["ladcd"]).strip() if pd.notna(postcode_row.iloc[0]["ladcd"]) else None
+    else:
+        # Neither postcode nor lat/lon provided
+        raise HTTPException(status_code=400, detail="Need postcode or lat/lon to evaluate.")
     
     # Extract postcode district for prime central London check
     postcode_district = ""
-    if " " in request.postcode:
-        postcode_district = request.postcode.split()[0].upper()
-    else:
-        # Try to extract district from postcode (first 2-4 chars)
-        postcode_clean = request.postcode.replace(" ", "").upper()
-        if len(postcode_clean) >= 2:
-            # Match pattern like SW1A, W1, EC1, etc.
-            match = re.match(r'([A-Z]{1,2}\d[A-Z]?)', postcode_clean)
-            if match:
-                postcode_district = match.group(1)
+    if request.postcode:
+        if " " in request.postcode:
+            postcode_district = request.postcode.split()[0].upper()
+        else:
+            # Try to extract district from postcode (first 2-4 chars)
+            postcode_clean = request.postcode.replace(" ", "").upper()
+            if len(postcode_clean) >= 2:
+                # Match pattern like SW1A, W1, EC1, etc.
+                match = re.match(r'([A-Z]{1,2}\d[A-Z]?)', postcode_clean)
+                if match:
+                    postcode_district = match.group(1)
     
     # Step 2: lat/lon -> nearest borough by matching postcode's borough column if present
     # Using ladcd to match with ons_clean, with fallback to area name matching
@@ -396,10 +1078,10 @@ async def evaluate_property(request: EvaluateRequest):
     used_borough_fallback = False
     missing_fields = []
     
-    if pd.notna(ladcd):
+    if ladcd and pd.notna(ladcd):
         ons_row = ons_data[ons_data["ladcd"] == ladcd]
         if not ons_row.empty:
-            borough = normalize_borough_name(ons_row.iloc[0]["area"])
+            borough = normalize_borough_name(str(ons_row.iloc[0]["area"]))
     
     # Check if postcode_lookup_clean has a borough/local authority name column
     # (e.g., "ladnm" or similar) - if it exists, use it as fallback
@@ -413,75 +1095,59 @@ async def evaluate_property(request: EvaluateRequest):
                 # Try to match by area name in ONS data
                 ons_row = ons_data[ons_data["area"].str.lower() == str(borough_name).lower().strip()]
                 if not ons_row.empty:
-                    borough = normalize_borough_name(ons_row.iloc[0]["area"])
+                    borough = normalize_borough_name(str(ons_row.iloc[0]["area"]))
                     used_borough_fallback = True
     
     # Step 3: borough -> median/lower/upper quartile from ons_clean
-    if ons_row is None or ons_row.empty:
-        return EvaluateResponse(
-            borough=borough,
-            listed_price_pcm=request.price_pcm,
-            expected_median_pcm=0.0,
-            expected_range_pcm=[0.0, 0.0],
-            deviation_pct=0.0,
-            classification="fair",
-            confidence="low",
-            explanations=["Borough data not available in ONS dataset"],
-            nearest_station_distance_m=0.0,
-            transport_adjustment_pct=0.0,
-            used_borough_fallback=used_borough_fallback,
-            extra_adjustment_pct=0.0,
-            adjustments_breakdown={"transport": 0.0, "furnished": 0.0, "bathrooms": 0.0, "size": 0.0, "quality": 0.0},
-            comps_used=False,
-            comps_sample_size=0,
-            comps_radius_m=0.0,
-            comps_expected_median_pcm=0.0,
-            comps_expected_range_pcm=[0.0, 0.0],
-            deviation_pct_damped=0.0,
-            confidence_adjusted=False,
-            adaptive_radius_used=False,
-            strong_similarity=False,
-            similarity_dampening_factor=0.0
-        )
+    # Check if we have lat/lon for comps/ML even if ONS is missing
+    has_geo = lat is not None and lon is not None and not (pd.isna(lat) or pd.isna(lon))
     
-    median_rent = ons_row.iloc[0]["median_rent"]
-    lower_quartile = ons_row.iloc[0]["lower_quartile_rent"]
-    upper_quartile = ons_row.iloc[0]["upper_quartile_rent"]
-    count_rents = ons_row.iloc[0]["count_rents"]
+    # If no ONS data and no geo, we can't evaluate
+    if (ons_row is None or ons_row.empty) and borough == "unknown" and not has_geo:
+        raise HTTPException(status_code=422, detail="Insufficient data for evaluation at this location.")
+    
+    # If we have ONS row, extract data
+    median_rent = None
+    lower_quartile = None
+    upper_quartile = None
+    count_rents = None
+    
+    if ons_row is not None and not ons_row.empty:
+        median_rent_val = ons_row.iloc[0].get("median_rent")
+        lower_quartile_val = ons_row.iloc[0].get("lower_quartile_rent")
+        upper_quartile_val = ons_row.iloc[0].get("upper_quartile_rent")
+        count_rents_val = ons_row.iloc[0].get("count_rents")
+        
+        # Convert to native Python types
+        median_rent = float(median_rent_val) if pd.notna(median_rent_val) else None
+        lower_quartile = float(lower_quartile_val) if pd.notna(lower_quartile_val) else None
+        upper_quartile = float(upper_quartile_val) if pd.notna(upper_quartile_val) else None
+        count_rents = int(count_rents_val) if pd.notna(count_rents_val) else None
     
     # Track missing fields for confidence adjustment
-    if pd.isna(lower_quartile) or lower_quartile == 0:
+    if lower_quartile is not None and (pd.isna(lower_quartile) or lower_quartile == 0):
         missing_fields.append("lower_quartile")
-    if pd.isna(upper_quartile) or upper_quartile == 0:
+    if upper_quartile is not None and (pd.isna(upper_quartile) or upper_quartile == 0):
         missing_fields.append("upper_quartile")
     
-    # Handle missing values
-    if pd.isna(median_rent) or median_rent == 0:
-        return EvaluateResponse(
-            borough=borough,
-            listed_price_pcm=request.price_pcm,
-            expected_median_pcm=0.0,
-            expected_range_pcm=[0.0, 0.0],
-            deviation_pct=0.0,
-            classification="fair",
-            confidence="low",
-            explanations=["Median rent data not available for this borough"],
-            nearest_station_distance_m=0.0,
-            transport_adjustment_pct=0.0,
-            used_borough_fallback=used_borough_fallback,
-            extra_adjustment_pct=0.0,
-            adjustments_breakdown={"transport": 0.0, "furnished": 0.0, "bathrooms": 0.0, "size": 0.0, "quality": 0.0},
-            comps_used=False,
-            comps_sample_size=0,
-            comps_radius_m=0.0,
-            comps_expected_median_pcm=0.0,
-            comps_expected_range_pcm=[0.0, 0.0],
-            deviation_pct_damped=0.0,
-            confidence_adjusted=False,
-            adaptive_radius_used=False,
-            strong_similarity=False,
-            similarity_dampening_factor=0.0
-        )
+    # If no ONS data and no comps/ML available, we can't evaluate
+    if (median_rent is None or pd.isna(median_rent) or median_rent == 0):
+        # Check if we can use comps or ML
+        can_use_comps = comps_data is not None and len(comps_data) > 0 and has_geo
+        can_use_ml = ml_enabled and has_geo
+        
+        if not can_use_comps and not can_use_ml:
+            raise HTTPException(status_code=422, detail="Insufficient data for evaluation at this location.")
+        
+        # Set defaults for ONS if we're using comps/ML only
+        if median_rent is None or pd.isna(median_rent):
+            median_rent = 0.0
+        if lower_quartile is None or pd.isna(lower_quartile):
+            lower_quartile = 0.0
+        if upper_quartile is None or pd.isna(upper_quartile):
+            upper_quartile = 0.0
+        if count_rents is None or pd.isna(count_rents):
+            count_rents = 0
     
     # Step 4: Get bedroom multiplier
     bedrooms_key = str(request.bedrooms) if request.bedrooms < 5 else "5+"
@@ -489,6 +1155,22 @@ async def evaluate_property(request: EvaluateRequest):
         bedrooms_key = "studio"
     
     multiplier = BEDROOM_MULTIPLIERS.get(bedrooms_key, 1.0)
+    
+    # Calculate ONS-based expected values (if ONS data available)
+    expected_median_ons = 0.0
+    expected_lower_ons = 0.0
+    expected_upper_ons = 0.0
+    
+    if median_rent is not None and not pd.isna(median_rent) and median_rent > 0:
+        expected_median_ons = median_rent * multiplier
+        if lower_quartile is not None and not pd.isna(lower_quartile) and lower_quartile > 0:
+            expected_lower_ons = lower_quartile * multiplier
+        else:
+            expected_lower_ons = expected_median_ons * 0.85  # Fallback
+        if upper_quartile is not None and not pd.isna(upper_quartile) and upper_quartile > 0:
+            expected_upper_ons = upper_quartile * multiplier
+        else:
+            expected_upper_ons = expected_median_ons * 1.15  # Fallback
     
     # Step 5: Calculate nearest station distance and transport adjustment
     nearest_station_distance_m = float('inf')
@@ -504,15 +1186,14 @@ async def evaluate_property(request: EvaluateRequest):
     
     transport_adjustment_pct = get_transport_adjustment(nearest_station_distance_m)
     
-    # Step 6: Calculate ONS baseline expected values
-    expected_median_ons = median_rent * multiplier
-    expected_lower_ons = (lower_quartile * multiplier) if pd.notna(lower_quartile) else expected_median_ons * 0.8
-    expected_upper_ons = (upper_quartile * multiplier) if pd.notna(upper_quartile) else expected_median_ons * 1.2
-    
     # Step 6.5: Try to get comparables estimate
     comps_used = False
     comps_sample_size = 0
     comps_radius_m = 0.0
+    # Ensure these are native Python types
+    comps_used = bool(comps_used)
+    comps_sample_size = int(comps_sample_size)
+    comps_radius_m = float(comps_radius_m)
     comps_expected_median = 0.0
     comps_expected_range = [0.0, 0.0]
     adaptive_radius_used = False
@@ -525,40 +1206,93 @@ async def evaluate_property(request: EvaluateRequest):
         )
         
         # Check if adaptive radius was used (radius > 500m)
-        adaptive_radius_used = comps_radius_m > 500.0
+        adaptive_radius_used = bool(comps_radius_m > 500.0)
         
         if len(comps_selected) >= 8:
             comps_expected_median, comps_expected_range = compute_comps_estimate(comps_selected)
             comps_used = True
-            comps_sample_size = len(comps_selected)
+            comps_sample_size = int(len(comps_selected))
             
-            # Compute similarity strength score
-            exact_bedroom_matches = (comps_selected["bedrooms"] == request.bedrooms).sum()
-            exact_bedroom_match_pct = exact_bedroom_matches / len(comps_selected) if len(comps_selected) > 0 else 0.0
-            close_radius = comps_radius_m <= 1200.0
-            sufficient_comps = comps_sample_size >= 10
+            # Compute improved similarity strength score (5)
+            # A comparable is "similar" if:
+            # - bedrooms match exactly
+            # - property_type match exactly
+            # - bathrooms within ±1 (if present)
+            # - floor_area_sqm within ±15% (if available)
+            similar_count = 0
+            similarity_rules_applied = []
             
-            strong_similarity = (
-                exact_bedroom_match_pct >= 0.6
-                and close_radius
-                and sufficient_comps
-            )
+            subject_bathrooms = request.bathrooms if request.bathrooms else None
+            similarity_uses_area = area_used  # Track if area is used in similarity (B.3)
+            
+            for _, comp in comps_selected.iterrows():
+                is_similar = True
+                comp_rules = []
+                
+                # Bedrooms must match exactly
+                if comp["bedrooms"] != request.bedrooms:
+                    is_similar = False
+                else:
+                    comp_rules.append("bedrooms")
+                
+                # Property type must match exactly
+                comp_prop_type = parse_property_type(str(comp.get("property_type", "")))
+                subject_prop_type = parse_property_type(request.property_type)
+                if comp_prop_type != subject_prop_type:
+                    is_similar = False
+                else:
+                    comp_rules.append("property_type")
+                
+                # Bathrooms within ±1 (if both present)
+                if subject_bathrooms is not None:
+                    comp_bathrooms = comp.get("bathrooms")
+                    if comp_bathrooms is not None and pd.notna(comp_bathrooms):
+                        if abs(float(comp_bathrooms) - float(subject_bathrooms)) > 1:
+                            is_similar = False
+                        else:
+                            comp_rules.append("bathrooms")
+                
+                # Floor area within ±15% (ONLY if area_used == True) (B.3)
+                if area_used and area_used_sqm is not None:
+                    comp_floor_area = comp.get("floor_area_sqm")
+                    if comp_floor_area is not None and pd.notna(comp_floor_area) and comp_floor_area > 0:
+                        ratio = abs(float(comp_floor_area) - float(area_used_sqm)) / max(float(comp_floor_area), float(area_used_sqm))
+                        if ratio > 0.15:
+                            is_similar = False
+                        else:
+                            comp_rules.append("floor_area")
+                
+                if is_similar:
+                    similar_count += 1
+                    if comp_rules:
+                        similarity_rules_applied.extend(comp_rules)
+            
+            similarity_ratio = float(similar_count / len(comps_selected) if len(comps_selected) > 0 else 0.0)
+            strong_similarity = bool(similarity_ratio >= 0.6)
+            
+            # Deduplicate rules for debug
+            similarity_rules_applied = list(set(similarity_rules_applied))
         else:
             strong_similarity = False
+            similarity_ratio = 0.0
+            similarity_rules_applied = []
     else:
         strong_similarity = False
+        similarity_ratio = 0.0
+        similarity_rules_applied = []
     
     # Step 6.6: Blend comps with ONS baseline (with prime central London and divergence safeguards)
     prime_central_districts = {"SW1A", "SW1", "SW1X", "W1", "W1J", "W1K", "W1S", "WC2", "EC1", "EC2", "EC3", "EC4"}
-    is_prime_central = postcode_district in prime_central_districts
+    is_prime_central = bool(postcode_district in prime_central_districts)
     
     # Structural divergence safeguard
     structural_divergence = False
-    if comps_used and expected_median_ons > 0:
+    if comps_used and expected_median_ons > 0 and comps_expected_median > 0:
         ratio_comps_to_ons = comps_expected_median / expected_median_ons
         ratio_ons_to_comps = expected_median_ons / comps_expected_median
         if ratio_comps_to_ons > 2.5 or ratio_ons_to_comps > 2.5:
             structural_divergence = True
+    structural_divergence = bool(structural_divergence)
     
     # Determine blending weights
     if structural_divergence:
@@ -570,21 +1304,93 @@ async def evaluate_property(request: EvaluateRequest):
         if comps_sample_size >= 15:
             ons_weight = 0.0
         else:
-            ons_weight = 0.15
+            ons_weight = 0.15 if expected_median_ons > 0 else 0.0
         comps_weight = 1.0 - ons_weight
     elif comps_used:
-        # Standard blend: 70% comps, 30% ONS
-        comps_weight = 0.7
-        ons_weight = 0.3
+        # Standard blend: 70% comps, 30% ONS (if ONS available)
+        if expected_median_ons > 0:
+            comps_weight = 0.7
+            ons_weight = 0.3
+        else:
+            comps_weight = 1.0
+            ons_weight = 0.0
     else:
-        # Fall back to ONS only
-        comps_weight = 0.0
-        ons_weight = 1.0
+        # Fall back to ONS only (if available)
+        if expected_median_ons > 0:
+            comps_weight = 0.0
+            ons_weight = 1.0
+        else:
+            # No ONS, no comps - should have been caught earlier, but handle gracefully
+            comps_weight = 0.0
+            ons_weight = 0.0
     
-    # Blend
-    expected_median_base = comps_weight * comps_expected_median + ons_weight * expected_median_ons
-    expected_lower_base = comps_weight * comps_expected_range[0] + ons_weight * expected_lower_ons
-    expected_upper_base = comps_weight * comps_expected_range[1] + ons_weight * expected_upper_ons
+    # Compute ML prediction if available
+    ml_expected_median = None
+    if ml_enabled:
+        # Extract postcode district for ML prediction
+        postcode_district_ml = "UNKNOWN"
+        if request.postcode:
+            if " " in request.postcode:
+                postcode_district_ml = request.postcode.split()[0].upper()
+            else:
+                postcode_clean = request.postcode.replace(" ", "").upper()
+                if len(postcode_clean) >= 2:
+                    match = re.match(r'([A-Z]{1,2}\d[A-Z]?)', postcode_clean)
+                    if match:
+                        postcode_district_ml = match.group(1)
+        
+        # ML features: ONLY include area if area_used == True (B.5)
+        ml_floor_area = area_used_sqm if area_used else None
+        
+        ml_expected_median = compute_ml_prediction(
+            request.bedrooms,
+            request.bathrooms,
+            ml_floor_area,
+            request.property_type,
+            nearest_station_distance_m,
+            lat=lat,
+            lon=lon,
+            postcode_district=postcode_district_ml,
+            ladcd=ladcd if ladcd else None
+        )
+    
+    # Blend: Include ML if available
+    if comps_used and ml_expected_median is not None:
+        # Blend comps + ML + ONS
+        if ons_weight > 0:
+            expected_median_base = 0.55 * comps_expected_median + 0.35 * ml_expected_median + 0.10 * expected_median_ons
+            expected_lower_base = 0.55 * comps_expected_range[0] + 0.35 * ml_expected_median * 0.85 + 0.10 * expected_lower_ons
+            expected_upper_base = 0.55 * comps_expected_range[1] + 0.35 * ml_expected_median * 1.15 + 0.10 * expected_upper_ons
+        else:
+            # ONS ignored (prime central or divergence)
+            expected_median_base = 0.70 * comps_expected_median + 0.30 * ml_expected_median
+            expected_lower_base = 0.70 * comps_expected_range[0] + 0.30 * ml_expected_median * 0.85
+            expected_upper_base = 0.70 * comps_expected_range[1] + 0.30 * ml_expected_median * 1.15
+    elif comps_used:
+        # Existing logic: comps + ONS
+        expected_median_base = comps_weight * comps_expected_median + ons_weight * expected_median_ons
+        expected_lower_base = comps_weight * comps_expected_range[0] + ons_weight * expected_lower_ons
+        expected_upper_base = comps_weight * comps_expected_range[1] + ons_weight * expected_upper_ons
+    elif ml_expected_median is not None:
+        # ML + ONS (comps not used)
+        if ons_weight > 0:
+            expected_median_base = 0.70 * ml_expected_median + 0.30 * expected_median_ons
+            expected_lower_base = 0.70 * ml_expected_median * 0.85 + 0.30 * expected_lower_ons
+            expected_upper_base = 0.70 * ml_expected_median * 1.15 + 0.30 * expected_upper_ons
+        else:
+            # ONS ignored, use ML only
+            expected_median_base = ml_expected_median
+            expected_lower_base = ml_expected_median * 0.85
+            expected_upper_base = ml_expected_median * 1.15
+    else:
+        # Fallback to ONS only
+        expected_median_base = expected_median_ons
+        expected_lower_base = expected_lower_ons
+        expected_upper_base = expected_upper_ons
+    
+    # Final safeguard: if we have no valid estimate, return error
+    if expected_median_base <= 0:
+        raise HTTPException(status_code=422, detail="Insufficient data for evaluation at this location.")
     
     # Apply transport adjustment
     expected_median_after_transport = expected_median_base * (1 + transport_adjustment_pct)
@@ -594,7 +1400,11 @@ async def evaluate_property(request: EvaluateRequest):
     # Step 7: Calculate extra adjustments (furnished, bathrooms, floor area, quality)
     furnished_adj_base = get_furnished_adjustment(request.furnished)
     bathrooms_adj_base = get_bathrooms_adjustment(request.bathrooms, request.bedrooms)
-    floor_area_adj_base = get_floor_area_adjustment(request.floor_area_sqm, request.bedrooms)
+    # Size adjustment: ONLY if area_used == True (B.4)
+    if area_used and area_used_sqm is not None:
+        floor_area_adj_base = get_floor_area_adjustment(area_used_sqm, request.bedrooms)
+    else:
+        floor_area_adj_base = 0.0  # Must be 0 if area not used
     quality_adj_base = get_quality_adjustment(request.quality)
     
     # Apply similarity dampening if strong_similarity is True
@@ -611,23 +1421,55 @@ async def evaluate_property(request: EvaluateRequest):
         floor_area_adj = floor_area_adj_base
         quality_adj = quality_adj_base
     
+    # Step 7.5: Calculate photo condition adjustment (D, 6)
+    photo_adjustment_pct = 0.0
+    photos_used_count = 0
+    photo_condition_confidence_actual = None
+    
+    if request.photo_condition_label and request.photo_condition_score is not None:
+        photos_used_count = 1  # Simplified - actual count from analysis
+        photo_condition_confidence_actual = request.photo_condition_confidence
+        
+        # Base adjustment by label
+        label_adjustments = {
+            "dated": -0.08,
+            "average": 0.00,
+            "modern": +0.06,
+            "luxury": +0.12
+        }
+        base_adj = label_adjustments.get(request.photo_condition_label, 0.0)
+        
+        # Scale by score (score-50)/50, so score 0 = -1x, score 50 = 0x, score 100 = +1x
+        score_factor = (request.photo_condition_score - 50) / 50.0
+        photo_adjustment_pct = base_adj * score_factor
+        
+        # Cap to [-0.10, +0.15] normally, but max +5% if photos_used < 2 or confidence is low (6)
+        max_adj = 0.15
+        if photos_used_count < 2 or photo_condition_confidence_actual == "low":
+            max_adj = 0.05
+            photo_condition_confidence_actual = "low"  # Force low if insufficient photos
+        
+        photo_adjustment_pct = max(-0.10, min(max_adj, photo_adjustment_pct))
+    
     # Combine extra adjustments and cap to [-0.12, +0.12]
     extra_adjustment_pct = furnished_adj + bathrooms_adj + floor_area_adj + quality_adj
     extra_adjustment_pct = max(-0.12, min(0.12, extra_adjustment_pct))
     
-    # Build adjustments breakdown (show original values for transparency)
+    # Build adjustments breakdown (B.4: size MUST be 0 if area not used)
     adjustments_breakdown = {
         "transport": transport_adjustment_pct,
         "furnished": furnished_adj,
         "bathrooms": bathrooms_adj,
-        "size": floor_area_adj,
-        "quality": quality_adj
+        "size": floor_area_adj if area_used else 0.0,  # Must be 0 if area not used
+        "quality": quality_adj,
+        "photo": photo_adjustment_pct
     }
     
-    # Apply extra adjustment
-    expected_median = expected_median_after_transport * (1 + extra_adjustment_pct)
-    expected_lower = expected_lower_after_transport * (1 + extra_adjustment_pct)
-    expected_upper = expected_upper_after_transport * (1 + extra_adjustment_pct)
+    # Apply extra adjustment + photo adjustment
+    total_extra_adj = extra_adjustment_pct + photo_adjustment_pct
+    expected_median = expected_median_after_transport * (1 + total_extra_adj)
+    expected_lower = expected_lower_after_transport * (1 + total_extra_adj)
+    expected_upper = expected_upper_after_transport * (1 + total_extra_adj)
     expected_range = [expected_lower, expected_upper]
     
     # Step 8: Calculate deviation
@@ -664,6 +1506,7 @@ async def evaluate_property(request: EvaluateRequest):
             confidence = "medium"
         elif confidence == "medium":
             confidence = "low"
+    confidence_adjusted = bool(confidence_adjusted)
     
     # Step 9.5: Confidence-aware deviation damping
     deviation_pct_damped = deviation_pct
@@ -688,9 +1531,13 @@ async def evaluate_property(request: EvaluateRequest):
     
     # Generate explanations with transparent breakdown
     explanations = []
-    explanations.append(f"Property located in {borough}")
-    explanations.append(f"Base ONS median rent for borough: £{median_rent:.2f}/month")
-    explanations.append(f"Bedroom multiplier ({bedrooms_key} bedroom {request.property_type}): {multiplier:.2f}x → £{expected_median_ons:.2f}/month")
+    location_note = ""
+    if postcode_inferred:
+        location_note = f" (postcode inferred from coordinates, {inferred_postcode_dist_m:.0f}m from nearest)"
+    explanations.append(f"Property located in {borough}{location_note}")
+    if median_rent and median_rent > 0:
+        explanations.append(f"Base ONS median rent for borough: £{median_rent:.2f}/month")
+        explanations.append(f"Bedroom multiplier ({bedrooms_key} bedroom {request.property_type}): {multiplier:.2f}x → £{expected_median_ons:.2f}/month")
     
     if comps_used:
         radius_note = ""
@@ -719,7 +1566,7 @@ async def evaluate_property(request: EvaluateRequest):
             adj_details.append(f"furnished: {adjustments_breakdown['furnished']*100:+.1f}%")
         if adjustments_breakdown["bathrooms"] != 0:
             adj_details.append(f"bathrooms: {adjustments_breakdown['bathrooms']*100:+.1f}%")
-        if adjustments_breakdown["size"] != 0:
+        if area_used and adjustments_breakdown["size"] != 0:
             adj_details.append(f"size: {adjustments_breakdown['size']*100:+.1f}%")
         if adjustments_breakdown["quality"] != 0:
             adj_details.append(f"quality: {adjustments_breakdown['quality']*100:+.1f}%")
@@ -747,36 +1594,1792 @@ async def evaluate_property(request: EvaluateRequest):
     explanations.append(f"Confidence level: {confidence} (based on {int(count_rents) if pd.notna(count_rents) else 0} rental records){confidence_note}")
     explanations.append("Note: This is a borough baseline + size + accessibility estimate, not a guaranteed 'true rent'")
     
+    # Compute tight "Most-Likely Range" when evidence supports it (C)
+    most_likely_range_pcm = None
+    most_likely_range_basis = None
+    
+    if comps_used and comps_sample_size > 0:
+        # Step 1: Evidence gates
+        postcode_valid_check = (
+            (request.postcode and request.postcode.strip()) or
+            (postcode_inferred and inferred_postcode_dist_m and inferred_postcode_dist_m <= 500)
+        )
+        
+        evidence_gates = {
+            'comps_used': comps_used,
+            'sample_size': comps_sample_size >= 20,
+            'radius': comps_radius_m <= 800,
+            'strong_similarity': strong_similarity,
+            'location_precision': postcode_valid_check or (request.lat is not None and request.lon is not None),
+            'floor_area': (
+                (request.floor_area_sqm is not None and request.floor_area_sqm > 0) or
+                (floorplan_used and request.floorplan_confidence and request.floorplan_confidence != "low")
+            )
+        }
+        
+        all_gates_pass = all(evidence_gates.values())
+        
+        # Step 2: Measure local dispersion from final selected comps
+        # Re-select comps to get actual prices for dispersion calculation
+        comps_for_dispersion = None
+        if comps_data is not None and lat is not None and lon is not None:
+            try:
+                comps_selected, _ = select_comparables(
+                    lat, lon, request.bedrooms, request.property_type, comps_data
+                )
+                if len(comps_selected) > 0:
+                    comps_for_dispersion = comps_selected
+            except Exception:
+                pass
+        
+        if comps_for_dispersion is not None and len(comps_for_dispersion) > 0:
+            # Get top K comps (min 25, or sample_size)
+            top_k = min(25, len(comps_for_dispersion))
+            comps_prices = comps_for_dispersion.head(top_k)["price_pcm"].values
+            
+            if len(comps_prices) > 0 and comps_expected_median > 0:
+                # Compute median and MAD (median absolute deviation)
+                median_comp = float(np.median(comps_prices))
+                mad = float(np.median(np.abs(comps_prices - median_comp)))
+                # Convert MAD to robust sigma
+                sigma = 1.4826 * mad if mad > 0 else 0.0
+                relative_sigma = sigma / median_comp if median_comp > 0 else 0.0
+                
+                # Step 3: Determine tightness
+                if all_gates_pass:
+                    # Allow ~±4% to ±6% depending on dispersion
+                    width_pct = max(0.04, min(0.06, 1.25 * relative_sigma))
+                    width_pct = max(0.04, min(0.06, width_pct))  # Clamp to [4%, 6%]
+                else:
+                    # Standard range based on confidence
+                    if confidence == "low":
+                        width_pct = 0.15  # ±15%
+                    else:
+                        width_pct = 0.10  # ±10%
+                
+                # Step 5: If confidence is low, never allow tighter than ±8%
+                if confidence == "low":
+                    width_pct = max(width_pct, 0.08)
+                
+                # Step 4: Compute most_likely_range
+                if all_gates_pass or (comps_sample_size >= 15 and comps_radius_m <= 1200):
+                    most_likely_low = expected_median * (1 - width_pct)
+                    most_likely_high = expected_median * (1 + width_pct)
+                    most_likely_range_pcm = [float(most_likely_low), float(most_likely_high)]
+                    
+                    # Step 6: Set basis string
+                    if all_gates_pass:
+                        most_likely_range_basis = "tight range (strong local comps + low dispersion)"
+                    else:
+                        failed_gates = [k for k, v in evidence_gates.items() if not v]
+                        most_likely_range_basis = f"standard range (insufficient local evidence: {', '.join(failed_gates)})"
+    
+    # Compute quality score and debug info
+    quality_score, quality_label, quality_reasons = compute_estimate_quality_score(
+        comps_used=comps_used,
+        comps_sample_size=comps_sample_size,
+        comps_radius_m=comps_radius_m,
+        strong_similarity=strong_similarity,
+        confidence=confidence,
+        structural_divergence_triggered=structural_divergence,
+        ons_used=ons_weight > 0,
+        ml_used=ml_expected_median is not None
+    )
+    
+    # Determine location source and precision from request (F)
+    location_source_debug = "none"
+    location_precision_m_debug = None
+    geocoding_used_debug = False
+    
+    if request.lat is not None and request.lon is not None:
+        # Check if this came from parse-listing (would have location_source in response)
+        # For now, infer from context
+        location_source_debug = "provided"
+        # Try to infer precision if we can
+        if postcode_inferred and inferred_postcode_dist_m:
+            location_precision_m_debug = inferred_postcode_dist_m
+            location_source_debug = "inferred"
+    
+    debug_info = DebugInfo(
+        estimate_quality_score=quality_score,
+        quality_label=quality_label,
+        quality_reasons=quality_reasons,
+        model_components={
+            "ons_used": ons_weight > 0,
+            "comps_used": comps_used,
+            "ml_used": ml_expected_median is not None,
+            "comps_sample_size": comps_sample_size,
+            "comps_radius_m": comps_radius_m,
+            "strong_similarity": strong_similarity,
+            "similarity_ratio": similarity_ratio if 'similarity_ratio' in locals() else 0.0,
+            "similarity_rules_applied": similarity_rules_applied if 'similarity_rules_applied' in locals() else [],
+            "similarity_uses_area": similarity_uses_area if 'similarity_uses_area' in locals() else False,
+            "area_used": area_used,
+            "area_source": area_source,
+            "ml_mae": ml_mae if ml_enabled else None,
+            "ml_expected_median_pcm": ml_expected_median,
+            "portal_assets_used": bool(request.photo_condition_label or request.floorplan_area_sqm),
+            "photos_used": photos_used_count if 'photos_used_count' in locals() else (1 if request.photo_condition_label else 0),
+            "floorplan_used": bool(floorplan_used)
+        },
+        location_source=location_source_debug,
+        location_precision_m=location_precision_m_debug,
+        geocoding_used=geocoding_used_debug
+    )
+    
     return EvaluateResponse(
         borough=borough,
         listed_price_pcm=request.price_pcm,
-        expected_median_pcm=expected_median,
-        expected_range_pcm=expected_range,
-        deviation_pct=deviation_pct,
+        expected_median_pcm=float(expected_median),
+        expected_range_pcm=[float(expected_range[0]), float(expected_range[1])],
+        most_likely_range_pcm=most_likely_range_pcm,
+        most_likely_range_basis=most_likely_range_basis,
+        deviation_pct=float(deviation_pct),
         classification=classification,
         confidence=confidence,
         explanations=explanations,
         nearest_station_distance_m=nearest_station_distance_m,
         transport_adjustment_pct=transport_adjustment_pct,
-        used_borough_fallback=used_borough_fallback,
-        extra_adjustment_pct=extra_adjustment_pct,
-        adjustments_breakdown=adjustments_breakdown,
-        comps_used=comps_used,
-        comps_sample_size=comps_sample_size,
-        comps_radius_m=comps_radius_m,
-        comps_expected_median_pcm=comps_expected_median,
-        comps_expected_range_pcm=comps_expected_range,
-        deviation_pct_damped=deviation_pct_damped,
-        confidence_adjusted=confidence_adjusted,
-        adaptive_radius_used=adaptive_radius_used,
-        strong_similarity=strong_similarity,
-        similarity_dampening_factor=similarity_dampening_factor
+        used_borough_fallback=bool(used_borough_fallback),
+        extra_adjustment_pct=float(extra_adjustment_pct),
+        adjustments_breakdown={k: float(v) for k, v in adjustments_breakdown.items()},
+        comps_used=bool(comps_used),
+        comps_sample_size=int(comps_sample_size),
+        comps_radius_m=float(comps_radius_m),
+        comps_expected_median_pcm=float(comps_expected_median),
+        comps_expected_range_pcm=[float(comps_expected_range[0]), float(comps_expected_range[1])],
+        deviation_pct_damped=float(deviation_pct_damped),
+        confidence_adjusted=bool(confidence_adjusted),
+        adaptive_radius_used=bool(adaptive_radius_used),
+        strong_similarity=bool(strong_similarity),
+        similarity_dampening_factor=float(similarity_dampening_factor),
+        ml_expected_median_pcm=ml_expected_median,
+        photo_adjustment_pct=float(photo_adjustment_pct),
+        floorplan_used=bool(floorplan_used),
+        floorplan_area_sqm_used=float(floorplan_area_sqm_used) if floorplan_area_sqm_used else None,
+        area_used=bool(area_used),
+        area_source=area_source,
+        area_used_sqm=float(area_used_sqm) if area_used_sqm else None,
+        debug=debug_info
     )
 
 @app.get("/health")
 async def health():
     """Health check endpoint"""
     return {"ok": True}
+
+def extract_price_from_jsonld(html: str) -> Optional[Tuple[float, bool]]:
+    """
+    Extract price from JSON-LD structured data.
+    Returns (price_pcm, is_weekly) or None.
+    """
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        json_ld_scripts = soup.find_all('script', type='application/ld+json')
+        
+        for script in json_ld_scripts:
+            try:
+                data = json.loads(script.string)
+                # Handle arrays
+                if isinstance(data, list):
+                    for item in data:
+                        result = _extract_price_from_json_object(item)
+                        if result:
+                            return result
+                elif isinstance(data, dict):
+                    result = _extract_price_from_json_object(data)
+                    if result:
+                        return result
+            except (json.JSONDecodeError, AttributeError):
+                continue
+    except Exception:
+        pass
+    return None
+
+def extract_latlon_from_jsonld(html: str) -> Optional[Tuple[float, float]]:
+    """Extract latitude/longitude from JSON-LD structured data. Returns (lat, lon) or None."""
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        json_ld_scripts = soup.find_all('script', type='application/ld+json')
+        
+        for script in json_ld_scripts:
+            try:
+                data = json.loads(script.string)
+                # Handle arrays
+                if isinstance(data, list):
+                    for item in data:
+                        result = _extract_latlon_from_json_object(item)
+                        if result:
+                            return result
+                elif isinstance(data, dict):
+                    result = _extract_latlon_from_json_object(data)
+                    if result:
+                        return result
+            except (json.JSONDecodeError, AttributeError):
+                continue
+    except Exception:
+        pass
+    return None
+
+def _extract_latlon_from_json_object(obj: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """Helper to extract lat/lon from a JSON object."""
+    if not isinstance(obj, dict):
+        return None
+    
+    # Check geo.latitude/longitude
+    if 'geo' in obj:
+        geo = obj['geo']
+        if isinstance(geo, dict):
+            if 'latitude' in geo and 'longitude' in geo:
+                try:
+                    lat = float(geo['latitude'])
+                    lon = float(geo['longitude'])
+                    if -90 <= lat <= 90 and -180 <= lon <= 180:
+                        return (lat, lon)
+                except (ValueError, TypeError):
+                    pass
+    
+    # Check direct latitude/longitude fields
+    if 'latitude' in obj and 'longitude' in obj:
+        try:
+            lat = float(obj['latitude'])
+            lon = float(obj['longitude'])
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return (lat, lon)
+        except (ValueError, TypeError):
+            pass
+    
+    # Check location object
+    if 'location' in obj:
+        return _extract_latlon_from_json_object(obj['location'])
+    
+    return None
+
+def extract_latlon_from_scripts(html: str) -> Optional[Tuple[float, float]]:
+    """Extract latitude/longitude from embedded JavaScript variables."""
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        scripts = soup.find_all('script')
+        
+        patterns = [
+            r'["\']latitude["\']\s*:\s*([+-]?\d+\.?\d*)',
+            r'["\']longitude["\']\s*:\s*([+-]?\d+\.?\d*)',
+            r'["\']lat["\']\s*:\s*([+-]?\d+\.?\d*)',
+            r'["\']lng["\']\s*:\s*([+-]?\d+\.?\d*)',
+            r'["\']lon["\']\s*:\s*([+-]?\d+\.?\d*)',
+        ]
+        
+        lat = None
+        lon = None
+        
+        for script in scripts:
+            if not script.string:
+                continue
+            script_text = script.string
+            
+            # Try to find both lat and lon in same script
+            for pattern in patterns:
+                matches = re.findall(pattern, script_text, re.IGNORECASE)
+                if matches:
+                    for match in matches:
+                        try:
+                            val = float(match)
+                            if 'lat' in pattern.lower() or 'latitude' in pattern.lower():
+                                if lat is None and -90 <= val <= 90:
+                                    lat = val
+                            elif 'lon' in pattern.lower() or 'lng' in pattern.lower() or 'longitude' in pattern.lower():
+                                if lon is None and -180 <= val <= 180:
+                                    lon = val
+                        except (ValueError, TypeError):
+                            continue
+            
+            # Also try to find location object
+            location_patterns = [
+                r'["\']location["\']\s*:\s*\{[^}]*["\']latitude["\']\s*:\s*([+-]?\d+\.?\d*)[^}]*["\']longitude["\']\s*:\s*([+-]?\d+\.?\d*)',
+                r'["\']location["\']\s*:\s*\{[^}]*["\']lat["\']\s*:\s*([+-]?\d+\.?\d*)[^}]*["\']lng["\']\s*:\s*([+-]?\d+\.?\d*)',
+            ]
+            
+            for pattern in location_patterns:
+                matches = re.findall(pattern, script_text, re.IGNORECASE | re.DOTALL)
+                if matches and len(matches[0]) == 2:
+                    try:
+                        lat_val = float(matches[0][0])
+                        lon_val = float(matches[0][1])
+                        if -90 <= lat_val <= 90 and -180 <= lon_val <= 180:
+                            lat = lat_val
+                            lon = lon_val
+                            break
+                    except (ValueError, TypeError, IndexError):
+                        continue
+            
+            if lat is not None and lon is not None:
+                return (lat, lon)
+    except Exception:
+        pass
+    
+    return (lat, lon) if (lat is not None and lon is not None) else None
+
+def _extract_price_from_json_object(obj: Dict[str, Any]) -> Optional[Tuple[float, bool]]:
+    """Helper to extract price from a JSON object."""
+    if not isinstance(obj, dict):
+        return None
+    
+    def check_if_weekly(price_spec: Any) -> bool:
+        """Check if price specification indicates weekly pricing."""
+        if not isinstance(price_spec, dict):
+            return False
+        spec_str = json.dumps(price_spec).lower()
+        return any(term in spec_str for term in ['week', 'pw', 'per week', 'weekly'])
+    
+    # Check offers.price
+    if 'offers' in obj and isinstance(obj['offers'], dict):
+        offers = obj['offers']
+        if 'price' in offers:
+            price_val = offers['price']
+            if isinstance(price_val, (int, float)):
+                # Check if weekly from priceSpecification
+                is_weekly = check_if_weekly(offers.get('priceSpecification', {}))
+                return (float(price_val), is_weekly)
+        if 'priceSpecification' in offers and isinstance(offers['priceSpecification'], dict):
+            ps = offers['priceSpecification']
+            if 'price' in ps:
+                price_val = ps['price']
+                if isinstance(price_val, (int, float)):
+                    is_weekly = check_if_weekly(ps)
+                    return (float(price_val), is_weekly)
+    
+    # Check direct price field
+    if 'price' in obj:
+        price_val = obj['price']
+        if isinstance(price_val, (int, float)):
+            # Check surrounding context for weekly indicators
+            obj_str = json.dumps(obj).lower()
+            is_weekly = any(term in obj_str for term in ['week', 'pw', 'per week', 'weekly'])
+            return (float(price_val), is_weekly)
+    
+    return None
+
+def extract_price_from_scripts(html: str) -> Optional[float]:
+    """
+    Extract price from embedded JavaScript variables.
+    Returns price_pcm or None.
+    """
+    try:
+        # Look for patterns like "price":2600 or "rent":2600 in script tags
+        price_patterns = [
+            r'["\']price["\']\s*:\s*["\']?(\d+(?:,\d{3})*)["\']?',
+            r'["\']rent["\']\s*:\s*["\']?(\d+(?:,\d{3})*)["\']?',
+            r'price["\']?\s*=\s*["\']?(\d+(?:,\d{3})*)["\']?',
+            r'rent["\']?\s*=\s*["\']?(\d+(?:,\d{3})*)["\']?',
+        ]
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        scripts = soup.find_all('script')
+        
+        for script in scripts:
+            if not script.string:
+                continue
+            script_text = script.string
+            
+            for pattern in price_patterns:
+                matches = re.findall(pattern, script_text, re.IGNORECASE)
+                if matches:
+                    try:
+                        # Take first match, convert to float
+                        price_str = matches[0].replace(',', '')
+                        price = float(price_str)
+                        # Sanity check: reasonable rental price
+                        if 200 <= price <= 20000:
+                            return price
+                    except (ValueError, IndexError):
+                        continue
+    except Exception:
+        pass
+    return None
+
+def extract_postcode_candidates_from_jsonld(html: str) -> List[str]:
+    """Extract all postcode candidates from JSON-LD structured data."""
+    candidates = []
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        json_ld_scripts = soup.find_all('script', type='application/ld+json')
+        
+        for script in json_ld_scripts:
+            try:
+                data = json.loads(script.string)
+                # Handle arrays
+                if isinstance(data, list):
+                    for item in data:
+                        result = _extract_postcode_from_json_object(item)
+                        if result and result not in candidates:
+                            candidates.append(result)
+                elif isinstance(data, dict):
+                    result = _extract_postcode_from_json_object(data)
+                    if result and result not in candidates:
+                        candidates.append(result)
+            except (json.JSONDecodeError, AttributeError):
+                continue
+    except Exception:
+        pass
+    return candidates
+
+def _extract_postcode_from_json_object(obj: Dict[str, Any]) -> Optional[str]:
+    """Helper to extract postcode from a JSON object."""
+    if not isinstance(obj, dict):
+        return None
+    
+    # Check address.postalCode
+    if 'address' in obj:
+        address = obj['address']
+        if isinstance(address, dict) and 'postalCode' in address:
+            return str(address['postalCode']).strip()
+        elif isinstance(address, str):
+            # Sometimes address is a string, try to extract postcode
+            postcode_match = re.search(r'\b([A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})\b', address, re.IGNORECASE)
+            if postcode_match:
+                return postcode_match.group(1)
+    
+    # Check direct postalCode field
+    if 'postalCode' in obj:
+        return str(obj['postalCode']).strip()
+    
+    return None
+
+def extract_postcode_candidates_from_scripts(html: str) -> List[str]:
+    """Extract all postcode candidates from embedded JavaScript variables."""
+    candidates = []
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        scripts = soup.find_all('script')
+        
+        for script in scripts:
+            if not script.string:
+                continue
+            script_text = script.string
+            
+            # Look for postcode/postalCode in JSON-like structures
+            patterns = [
+                r'["\']postalCode["\']\s*:\s*["\']([^"\']+)["\']',
+                r'["\']postcode["\']\s*:\s*["\']([^"\']+)["\']',
+                r'postalCode["\']?\s*=\s*["\']([^"\']+)["\']',
+                r'postcode["\']?\s*=\s*["\']([^"\']+)["\']',
+            ]
+            
+            for pattern in patterns:
+                matches = re.findall(pattern, script_text, re.IGNORECASE)
+                for match in matches:
+                    postcode_str = match.strip()
+                    # Validate it looks like a postcode
+                    if re.match(r'^[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}$', postcode_str, re.IGNORECASE):
+                        if postcode_str not in candidates:
+                            candidates.append(postcode_str)
+    except Exception:
+        pass
+    return candidates
+
+def extract_postcode_candidates_from_regex(html: str) -> List[str]:
+    """Extract all postcode candidates using regex pattern."""
+    candidates = []
+    try:
+        postcode_pattern = r'\b([A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})\b'
+        matches = re.findall(postcode_pattern, html, re.IGNORECASE)
+        for match in matches:
+            postcode_str = match.strip()
+            if postcode_str not in candidates:
+                candidates.append(postcode_str)
+    except Exception:
+        pass
+    return candidates
+
+def validate_postcode_candidate(candidate: str) -> bool:
+    """Validate a postcode candidate against lookup sets."""
+    normalized = normalize_postcode(candidate)
+    normalized_nospace = normalized.replace(" ", "")
+    return normalized in valid_postcodes or normalized_nospace in valid_postcode_nospace
+
+# --- Portal Assets Helpers (A) ---
+def safe_fetch_image(url: str, max_size_mb: int = 8, timeout: int = 8) -> Optional[bytes]:
+    """Safely fetch an image URL with size and timeout limits. Returns bytes or None."""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        response.raise_for_status()
+        
+        # Check content type
+        content_type = response.headers.get('content-type', '').lower()
+        if not content_type.startswith('image/'):
+            return None
+        
+        # Check size
+        max_bytes = max_size_mb * 1024 * 1024
+        content_length = response.headers.get('content-length')
+        if content_length and int(content_length) > max_bytes:
+            return None
+        
+        # Read with size limit
+        data = b''
+        for chunk in response.iter_content(chunk_size=8192):
+            data += chunk
+            if len(data) > max_bytes:
+                return None
+        
+        return data
+    except Exception:
+        return None
+
+def extract_image_urls_from_jsonld(html: str) -> List[str]:
+    """Extract image URLs from JSON-LD structured data."""
+    image_urls = []
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        json_ld_scripts = soup.find_all('script', type='application/ld+json')
+        
+        for script in json_ld_scripts:
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, list):
+                    for item in data:
+                        urls = _extract_images_from_json_object(item)
+                        image_urls.extend(urls)
+                elif isinstance(data, dict):
+                    urls = _extract_images_from_json_object(data)
+                    image_urls.extend(urls)
+            except (json.JSONDecodeError, AttributeError):
+                continue
+    except Exception:
+        pass
+    return image_urls
+
+def _extract_images_from_json_object(obj: Dict[str, Any]) -> List[str]:
+    """Recursively extract image URLs from JSON object."""
+    urls = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key.lower() in ['image', 'photo', 'photos', 'imageurl', 'propertyimages']:
+                if isinstance(value, str) and value.startswith('http'):
+                    urls.append(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str) and item.startswith('http'):
+                            urls.append(item)
+                        elif isinstance(item, dict) and 'url' in item:
+                            urls.append(item['url'])
+            else:
+                urls.extend(_extract_images_from_json_object(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            urls.extend(_extract_images_from_json_object(item))
+    return urls
+
+def extract_image_urls_from_scripts(html: str) -> List[str]:
+    """Extract image URLs from embedded JavaScript."""
+    image_urls = []
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        scripts = soup.find_all('script')
+        
+        patterns = [
+            r'["\']image["\']\s*:\s*["\']([^"\']+)["\']',
+            r'["\']imageUrl["\']\s*:\s*["\']([^"\']+)["\']',
+            r'["\']photos["\']\s*:\s*\[([^\]]+)\]',
+            r'["\']propertyImages["\']\s*:\s*\[([^\]]+)\]',
+        ]
+        
+        for script in scripts:
+            if not script.string:
+                continue
+            script_text = script.string
+            
+            for pattern in patterns:
+                matches = re.findall(pattern, script_text, re.IGNORECASE)
+                for match in matches:
+                    # Try to extract URLs from match
+                    url_matches = re.findall(r'https?://[^\s"\'<>]+', match)
+                    image_urls.extend(url_matches)
+    except Exception:
+        pass
+    return image_urls
+
+def extract_floorplan_url(html: str) -> Optional[str]:
+    """Extract floorplan URL from HTML."""
+    floorplan_url = None
+    try:
+        # Search in scripts for floorplan keywords
+        script_patterns = [
+            r'["\']floorplan["\']\s*:\s*["\']([^"\']+)["\']',
+            r'["\']floorPlan["\']\s*:\s*["\']([^"\']+)["\']',
+            r'["\']floor_plan["\']\s*:\s*["\']([^"\']+)["\']',
+        ]
+        
+        soup = BeautifulSoup(html, 'html.parser')
+        scripts = soup.find_all('script')
+        for script in scripts:
+            if not script.string:
+                continue
+            for pattern in script_patterns:
+                matches = re.findall(pattern, script.string, re.IGNORECASE)
+                for match in matches:
+                    if 'floorplan' in match.lower() and match.startswith('http'):
+                        floorplan_url = match
+                        break
+                if floorplan_url:
+                    break
+            if floorplan_url:
+                break
+        
+        # Also search for links/hrefs containing floorplan
+        if not floorplan_url:
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                if 'floorplan' in href.lower() and href.startswith('http'):
+                    floorplan_url = href
+                    break
+        
+        # Search img tags with floorplan in src or alt
+        if not floorplan_url:
+            for img in soup.find_all('img', src=True):
+                src = img.get('src', '')
+                alt = img.get('alt', '').lower()
+                if 'floorplan' in src.lower() or 'floorplan' in alt:
+                    if src.startswith('http'):
+                        floorplan_url = src
+                        break
+    except Exception:
+        pass
+    
+    return floorplan_url
+
+def normalize_image_urls(urls: List[str]) -> List[str]:
+    """Normalize and deduplicate image URLs."""
+    normalized = []
+    seen = set()
+    
+    for url in urls:
+        if not url or not url.startswith('https://'):
+            continue
+        
+        # Remove query params for deduplication (keep original for fetching)
+        url_base = url.split('?')[0]
+        if url_base not in seen:
+            seen.add(url_base)
+            normalized.append(url)
+    
+    # Prefer larger images if obvious from URL
+    def url_priority(url: str) -> int:
+        priority = 0
+        url_lower = url.lower()
+        if any(keyword in url_lower for keyword in ['large', 'full', '1024', '1280', '1920']):
+            priority += 10
+        if any(keyword in url_lower for keyword in ['thumb', 'small', '64', '128']):
+            priority -= 10
+        return priority
+    
+    normalized.sort(key=url_priority, reverse=True)
+    return normalized[:10]  # Max 10 for UI
+
+def choose_best_postcode(candidates: List[Dict[str, Any]], html: str) -> Tuple[Optional[str], str]:
+    """
+    Choose the best postcode from candidates using priority rules.
+    Returns (chosen_postcode, source)
+    """
+    if not candidates:
+        return None, "unknown"
+    
+    # Priority 1: Valid JSON-LD candidates
+    jsonld_valid = [c for c in candidates if c['source'] == 'jsonld' and c['valid']]
+    if jsonld_valid:
+        return jsonld_valid[0]['value'], 'jsonld'
+    
+    # Priority 2: Valid script candidates (pick most frequent)
+    script_valid = [c for c in candidates if c['source'] == 'script' and c['valid']]
+    if script_valid:
+        # Count frequency
+        value_counts = Counter(c['value'] for c in script_valid)
+        most_common = value_counts.most_common(1)[0][0]
+        return most_common, 'script'
+    
+    # Priority 3: Valid regex candidates (pick closest to keywords)
+    regex_valid = [c for c in candidates if c['source'] == 'regex' and c['valid']]
+    if regex_valid:
+        keywords = ['postcode', 'address', 'location', 'property']
+        html_lower = html.lower()
+        
+        def distance_to_keywords(postcode_value):
+            # Find postcode position in HTML
+            postcode_lower = postcode_value.lower()
+            postcode_pos = html_lower.find(postcode_lower)
+            if postcode_pos == -1:
+                return float('inf')
+            
+            # Find nearest keyword
+            min_dist = float('inf')
+            for keyword in keywords:
+                keyword_pos = html_lower.find(keyword)
+                if keyword_pos != -1:
+                    dist = abs(postcode_pos - keyword_pos)
+                    min_dist = min(min_dist, dist)
+            
+            return min_dist if min_dist != float('inf') else 10000
+        
+        # Sort by distance to keywords
+        regex_valid.sort(key=lambda c: distance_to_keywords(c['value']))
+        return regex_valid[0]['value'], 'regex'
+    
+    # No valid candidates
+    return None, "unknown"
+
+def extract_price_from_text(html: str) -> Optional[float]:
+    """
+    Extract price from visible text (last resort).
+    Returns price_pcm or None.
+    """
+    try:
+        # Look for monthly prices only (ignore weekly unless explicitly marked)
+        monthly_patterns = [
+            r'£\s*(\d{1,3}(?:,\d{3})*)\s*(?:per\s*month|/pcm|pcm|/month)',
+            r'(\d{1,3}(?:,\d{3})*)\s*£\s*(?:per\s*month|/pcm|pcm|/month)',
+        ]
+        
+        for pattern in monthly_patterns:
+            matches = re.findall(pattern, html, re.IGNORECASE)
+            if matches:
+                try:
+                    price_str = matches[0].replace(',', '')
+                    price = float(price_str)
+                    if 200 <= price <= 20000:
+                        return price
+                except (ValueError, IndexError):
+                    continue
+    except Exception:
+        pass
+    return None
+
+def extract_from_key_facts(soup: BeautifulSoup) -> Dict[str, Any]:
+    """
+    Extract bathrooms, floor_area_sqm, and furnished from structured Key Facts section.
+    Returns dict with extracted values and extraction method used.
+    """
+    result = {
+        'bathrooms': None,
+        'floor_area_sqm': None,
+        'furnished': None,
+        'method': None
+    }
+    
+    try:
+        # Look for Key Facts sections - common patterns in Rightmove
+        # Try various selectors and structures
+        key_facts_section = None
+        
+        # Try by class/id with various patterns
+        key_facts_selectors = [
+            {'class': re.compile('key.*fact', re.I)},
+            {'id': re.compile('key.*fact', re.I)},
+            {'data-test': re.compile('key.*fact', re.I)},
+            {'class': re.compile('property.*detail', re.I)},
+            {'class': re.compile('summary|overview', re.I)},
+        ]
+        
+        for selector in key_facts_selectors:
+            key_facts_section = soup.find(attrs=selector)
+            if key_facts_section:
+                break
+        
+        # Also try finding <dl>, <ul>, or <div> with key facts patterns
+        if not key_facts_section:
+            key_facts_section = soup.find('dl', class_=re.compile('key|fact|detail', re.I))
+        if not key_facts_section:
+            key_facts_section = soup.find('ul', class_=re.compile('key|fact|detail', re.I))
+        if not key_facts_section:
+            key_facts_section = soup.find('div', class_=re.compile('key|fact|detail|summary', re.I))
+        
+        if not key_facts_section:
+            return result
+        
+        result['method'] = 'key_facts'
+        text_content = key_facts_section.get_text().lower()
+        
+        # Extract bathrooms
+        bathroom_patterns = [
+            r'(\d+)\s*(?:bathroom|bath)',
+            r'bathroom[s]?[:\s]+(\d+)',
+        ]
+        for pattern in bathroom_patterns:
+            matches = re.findall(pattern, text_content, re.IGNORECASE)
+            if matches:
+                try:
+                    bathrooms = int(matches[0])
+                    if 0 <= bathrooms <= 10:
+                        result['bathrooms'] = bathrooms
+                        break
+                except (ValueError, IndexError):
+                    continue
+        
+        # Extract floor area
+        area_patterns = [
+            r'(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:sq\s*ft|sqft|square\s*feet)',
+            r'(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:sq\s*m|sqm|square\s*meters?|m²)',
+            r'floor\s*area[:\s]+(\d+(?:,\d{3})*(?:\.\d+)?)',
+        ]
+        for pattern in area_patterns:
+            matches = re.findall(pattern, text_content, re.IGNORECASE)
+            if matches:
+                try:
+                    area_str = matches[0].replace(',', '')
+                    area_val = float(area_str)
+                    # Check if it's sq ft (typically > 100) or sqm (typically < 500)
+                    if 'sq ft' in pattern.lower() or 'sqft' in pattern.lower() or 'square feet' in pattern.lower():
+                        # Convert sq ft to sqm
+                        area_val = area_val * 0.092903
+                    result['floor_area_sqm'] = round(area_val, 2)
+                    break
+                except (ValueError, IndexError):
+                    continue
+        
+        # Extract furnished status
+        furnished_keywords = {
+            'furnished': True,
+            'unfurnished': False,
+            'part furnished': 'unknown',
+            'partially furnished': 'unknown',
+        }
+        for keyword, value in furnished_keywords.items():
+            if keyword in text_content:
+                result['furnished'] = str(value).lower() if isinstance(value, bool) else value
+                break
+        
+    except Exception:
+        pass
+    
+    return result
+
+def extract_from_embedded_js(html: str) -> Dict[str, Any]:
+    """
+    Extract bathrooms, floor_area_sqm, and furnished from embedded JavaScript.
+    Returns dict with extracted values.
+    """
+    result = {
+        'bathrooms': None,
+        'floor_area_sqm': None,
+        'furnished': None,
+        'method': None
+    }
+    
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        scripts = soup.find_all('script')
+        
+        for script in scripts:
+            if not script.string:
+                continue
+            script_text = script.string
+            
+            # Extract bathrooms
+            if not result['bathrooms']:
+                bathroom_patterns = [
+                    r'["\']bathrooms?["\']\s*:\s*["\']?(\d+)["\']?',
+                    r'["\']bath["\']\s*:\s*["\']?(\d+)["\']?',
+                    r'["\']bathCount["\']\s*:\s*["\']?(\d+)["\']?',
+                    r'bathrooms?\s*=\s*["\']?(\d+)["\']?',
+                ]
+                for pattern in bathroom_patterns:
+                    matches = re.findall(pattern, script_text, re.IGNORECASE)
+                    if matches:
+                        try:
+                            bathrooms = int(matches[0])
+                            if 0 <= bathrooms <= 10:
+                                result['bathrooms'] = bathrooms
+                                result['method'] = 'embedded_js'
+                                break
+                        except (ValueError, IndexError):
+                            continue
+            
+            # Extract floor area
+            if not result['floor_area_sqm']:
+                area_patterns = [
+                    r'["\']floorArea["\']\s*:\s*["\']?(\d+(?:\.\d+)?)["\']?',
+                    r'["\']floor_area["\']\s*:\s*["\']?(\d+(?:\.\d+)?)["\']?',
+                    r'["\']size["\']\s*:\s*["\']?(\d+(?:\.\d+)?)["\']?',
+                    r'floorArea\s*=\s*["\']?(\d+(?:\.\d+)?)["\']?',
+                ]
+                for pattern in area_patterns:
+                    matches = re.findall(pattern, script_text, re.IGNORECASE)
+                    if matches:
+                        try:
+                            area_val = float(matches[0])
+                            # Assume sqm if reasonable, otherwise might be sqft
+                            if area_val > 1000:  # Likely sqft
+                                area_val = area_val * 0.092903
+                            result['floor_area_sqm'] = round(area_val, 2)
+                            if not result['method']:
+                                result['method'] = 'embedded_js'
+                            break
+                        except (ValueError, IndexError):
+                            continue
+            
+            # Extract furnished status
+            if not result['furnished']:
+                furnished_patterns = [
+                    r'["\']furnishedType["\']\s*:\s*["\']([^"\']+)["\']',
+                    r'["\']furnished["\']\s*:\s*["\']?([^"\',\s]+)["\']?',
+                ]
+                for pattern in furnished_patterns:
+                    matches = re.findall(pattern, script_text, re.IGNORECASE)
+                    if matches:
+                        furnished_str = matches[0].lower()
+                        if 'furnished' in furnished_str and 'un' not in furnished_str:
+                            result['furnished'] = 'true'
+                        elif 'unfurnished' in furnished_str:
+                            result['furnished'] = 'false'
+                        elif 'part' in furnished_str:
+                            result['furnished'] = 'unknown'
+                        if not result['method']:
+                            result['method'] = 'embedded_js'
+                        break
+        
+    except Exception:
+        pass
+    
+    return result
+
+def extract_from_description(html: str) -> Dict[str, Any]:
+    """
+    Extract bathrooms, floor_area_sqm, and furnished from description text (lowest confidence).
+    Returns dict with extracted values.
+    """
+    result = {
+        'bathrooms': None,
+        'floor_area_sqm': None,
+        'furnished': None,
+        'method': None
+    }
+    
+    try:
+        # Look for description sections
+        soup = BeautifulSoup(html, 'html.parser')
+        description_selectors = [
+            {'class': re.compile('description', re.I)},
+            {'id': re.compile('description', re.I)},
+            {'data-test': re.compile('description', re.I)},
+        ]
+        
+        description_text = ''
+        for selector in description_selectors:
+            desc_elem = soup.find(attrs=selector)
+            if desc_elem:
+                description_text = desc_elem.get_text()
+                break
+        
+        # Fallback to body text if no description section found
+        if not description_text:
+            body = soup.find('body')
+            if body:
+                description_text = body.get_text()
+        
+        description_lower = description_text.lower()
+        
+        # Extract bathrooms (be conservative - only if unambiguous)
+        bathroom_pattern = r'(\d+)\s*(?:bathroom|bath)(?!\s*(?:and|or|\+))'
+        matches = re.findall(bathroom_pattern, description_lower, re.IGNORECASE)
+        if matches and len(matches) == 1:  # Only if single unambiguous match
+            try:
+                bathrooms = int(matches[0])
+                if 0 <= bathrooms <= 10:
+                    result['bathrooms'] = bathrooms
+                    result['method'] = 'description'
+            except (ValueError, IndexError):
+                pass
+        
+        # Extract floor area (be conservative)
+        area_patterns = [
+            r'(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:sq\s*ft|sqft)',
+            r'(\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:sq\s*m|sqm|m²)',
+        ]
+        for pattern in area_patterns:
+            matches = re.findall(pattern, description_lower, re.IGNORECASE)
+            if matches and len(matches) == 1:  # Only if single unambiguous match
+                try:
+                    area_str = matches[0].replace(',', '')
+                    area_val = float(area_str)
+                    # Convert sq ft to sqm if needed
+                    if 'sq ft' in pattern.lower() or 'sqft' in pattern.lower():
+                        area_val = area_val * 0.092903
+                    result['floor_area_sqm'] = round(area_val, 2)
+                    if not result['method']:
+                        result['method'] = 'description'
+                    break
+                except (ValueError, IndexError):
+                    continue
+        
+        # Extract furnished status (be conservative)
+        if 'furnished' in description_lower and 'unfurnished' not in description_lower:
+            result['furnished'] = 'true'
+            if not result['method']:
+                result['method'] = 'description'
+        elif 'unfurnished' in description_lower:
+            result['furnished'] = 'false'
+            if not result['method']:
+                result['method'] = 'description'
+        elif 'part' in description_lower and 'furnished' in description_lower:
+            result['furnished'] = 'unknown'
+            if not result['method']:
+                result['method'] = 'description'
+        
+    except Exception:
+        pass
+    
+    return result
+
+@app.post("/parse-listing", response_model=ParseListingResponse)
+async def parse_listing(request: ParseListingRequest):
+    """
+    This endpoint is for user-provided, single-listing convenience only.
+    Extracts basic property details from Rightmove or Zoopla listing URLs.
+    Does not store HTML or extracted data.
+    """
+    warnings = []
+    price_pcm = None
+    bedrooms = None
+    property_type = None
+    postcode = None
+    parsing_confidence = "low"
+    extracted_fields = []
+    
+    try:
+        # Validate URL
+        parsed_url = urlparse(request.url)
+        hostname = parsed_url.netloc.lower()
+        
+        if 'rightmove.co.uk' not in hostname and 'zoopla.co.uk' not in hostname:
+            raise HTTPException(status_code=400, detail="URL must be from Rightmove or Zoopla")
+        
+        # Fetch HTML once (no retries, no storage)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        }
+        response = requests.get(request.url, headers=headers, timeout=10)
+        response.raise_for_status()
+        html = response.text
+        
+        # Parse with BeautifulSoup
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Extract price with priority: JSON-LD > Scripts > Text
+        if 'rightmove.co.uk' in hostname:
+            # Method A: JSON-LD (preferred)
+            jsonld_result = extract_price_from_jsonld(html)
+            if jsonld_result:
+                price_val, is_weekly = jsonld_result
+                if is_weekly:
+                    price_pcm = price_val * (52 / 12)  # Convert weekly to monthly
+                else:
+                    price_pcm = price_val
+                parsing_confidence = "high"
+                extracted_fields.append("price")
+            
+            # Method B: Embedded scripts (fallback)
+            if not price_pcm:
+                script_price = extract_price_from_scripts(html)
+                if script_price:
+                    price_pcm = script_price
+                    parsing_confidence = "medium"
+                    extracted_fields.append("price")
+            
+            # Method C: Visible text (last resort)
+            if not price_pcm:
+                text_price = extract_price_from_text(html)
+                if text_price:
+                    price_pcm = text_price
+                    parsing_confidence = "low"
+                    extracted_fields.append("price")
+        
+        elif 'zoopla.co.uk' in hostname:
+            # Zoopla: try JSON-LD first, then fallback to existing method
+            jsonld_result = extract_price_from_jsonld(html)
+            if jsonld_result:
+                price_val, is_weekly = jsonld_result
+                if is_weekly:
+                    price_pcm = price_val * (52 / 12)
+                else:
+                    price_pcm = price_val
+                parsing_confidence = "high"
+                extracted_fields.append("price")
+            else:
+                # Fallback to existing Zoopla parsing
+                price_elem = soup.find('p', class_=re.compile('price|rent', re.I))
+                if not price_elem:
+                    price_elem = soup.find(attrs={'data-testid': re.compile('price', re.I)})
+                
+                if price_elem:
+                    price_text = price_elem.get_text()
+                    price_match = re.search(r'[\d,]+', price_text.replace(',', ''))
+                    if price_match:
+                        price_pcm = float(price_match.group().replace(',', ''))
+                        parsing_confidence = "medium"
+                        extracted_fields.append("price")
+        
+        if not price_pcm:
+            warnings.append("Could not reliably extract price — please enter manually")
+            parsing_confidence = "low"
+        
+        # Extract bedrooms
+        bedroom_patterns = [
+            r'(\d+)\s*bed',
+            r'(\d+)\s*bedroom',
+            r'bedrooms?[:\s]+(\d+)',
+        ]
+        
+        bedroom_found = False
+        for pattern in bedroom_patterns:
+            matches = re.findall(pattern, html, re.IGNORECASE)
+            if matches:
+                try:
+                    bedrooms = int(matches[0])
+                    if 0 <= bedrooms <= 10:
+                        bedroom_found = True
+                        extracted_fields.append("bedrooms")
+                        break
+                except:
+                    continue
+        
+        if not bedroom_found:
+            warnings.append("Could not reliably extract bedrooms — please check")
+        
+        # Extract property type
+        property_type_map = {
+            'flat': ['flat', 'apartment', 'maisonette'],
+            'house': ['house', 'terraced', 'semi-detached', 'detached', 'cottage'],
+            'studio': ['studio'],
+            'room': ['room', 'hmo', 'shared']
+        }
+        
+        html_lower = html.lower()
+        for prop_type, keywords in property_type_map.items():
+            if any(keyword in html_lower for keyword in keywords):
+                property_type = prop_type
+                extracted_fields.append("property_type")
+                break
+        
+        if not property_type:
+            warnings.append("Could not determine property type — defaulting to 'flat'")
+            property_type = "flat"
+        
+        # Extract address text (best-effort) (C)
+        address_text = None
+        try:
+            # Try to find address in common locations
+            address_selectors = [
+                {'class': re.compile('address', re.I)},
+                {'data-test': re.compile('address', re.I)},
+                {'itemprop': 'address'},
+            ]
+            
+            for selector in address_selectors:
+                addr_elem = soup.find(attrs=selector)
+                if addr_elem:
+                    address_text = addr_elem.get_text(strip=True)
+                    break
+            
+            # Fallback: look for structured address in JSON-LD
+            if not address_text:
+                json_ld_scripts = soup.find_all('script', type='application/ld+json')
+                for script in json_ld_scripts:
+                    try:
+                        data = json.loads(script.string)
+                        if isinstance(data, list):
+                            data = data[0] if data else {}
+                        if isinstance(data, dict):
+                            if 'address' in data:
+                                addr_obj = data['address']
+                                if isinstance(addr_obj, dict):
+                                    # Build address string from components
+                                    addr_parts = []
+                                    if 'streetAddress' in addr_obj:
+                                        addr_parts.append(str(addr_obj['streetAddress']))
+                                    if 'addressLocality' in addr_obj:
+                                        addr_parts.append(str(addr_obj['addressLocality']))
+                                    if addr_parts:
+                                        address_text = ', '.join(addr_parts)
+                                        break
+                    except (json.JSONDecodeError, AttributeError, KeyError):
+                        continue
+        except Exception:
+            pass
+        
+        # Extract lat/lon (B)
+        lat = None
+        lon = None
+        location_source = "none"
+        
+        if 'rightmove.co.uk' in hostname or 'zoopla.co.uk' in hostname:
+            # Priority 1: JSON-LD
+            jsonld_latlon = extract_latlon_from_jsonld(html)
+            if jsonld_latlon:
+                lat, lon = jsonld_latlon
+                location_source = "jsonld"
+                extracted_fields.append("location")
+            
+            # Priority 2: Embedded scripts
+            if lat is None or lon is None:
+                script_latlon = extract_latlon_from_scripts(html)
+                if script_latlon:
+                    lat, lon = script_latlon
+                    location_source = "script"
+                    extracted_fields.append("location")
+            
+            # Priority 3: HTML meta tags (rare)
+            if lat is None or lon is None:
+                meta_lat = soup.find('meta', property='geo:latitude')
+                meta_lon = soup.find('meta', property='geo:longitude')
+                if meta_lat and meta_lon:
+                    try:
+                        lat = float(meta_lat.get('content', ''))
+                        lon = float(meta_lon.get('content', ''))
+                        location_source = "html"
+                        extracted_fields.append("location")
+                    except (ValueError, TypeError):
+                        pass
+        
+        # Extract postcode candidates from all sources
+        postcode_candidates_raw = []
+        
+        if 'rightmove.co.uk' in hostname:
+            # Collect candidates from all sources
+            jsonld_candidates = extract_postcode_candidates_from_jsonld(html)
+            for candidate in jsonld_candidates:
+                normalized = normalize_postcode(candidate)
+                postcode_candidates_raw.append({
+                    'value': normalized,
+                    'source': 'jsonld',
+                    'original': candidate
+                })
+            
+            script_candidates = extract_postcode_candidates_from_scripts(html)
+            for candidate in script_candidates:
+                normalized = normalize_postcode(candidate)
+                postcode_candidates_raw.append({
+                    'value': normalized,
+                    'source': 'script',
+                    'original': candidate
+                })
+            
+            regex_candidates = extract_postcode_candidates_from_regex(html)
+            for candidate in regex_candidates:
+                normalized = normalize_postcode(candidate)
+                postcode_candidates_raw.append({
+                    'value': normalized,
+                    'source': 'regex',
+                    'original': candidate
+                })
+        
+        # Validate all candidates
+        postcode_candidates = []
+        seen_values = set()
+        for candidate in postcode_candidates_raw:
+            value = candidate['value']
+            if value in seen_values:
+                continue
+            seen_values.add(value)
+            is_valid = validate_postcode_candidate(value)
+            postcode_candidates.append(PostcodeCandidate(
+                value=value,
+                source=candidate['source'],
+                valid=is_valid
+            ))
+        
+        # Choose best postcode using priority rules
+        candidates_dict = [{'value': c.value, 'source': c.source, 'valid': c.valid} for c in postcode_candidates]
+        chosen_postcode, chosen_source = choose_best_postcode(candidates_dict, html)
+        
+        postcode = chosen_postcode
+        postcode_source = chosen_source
+        postcode_valid = chosen_postcode is not None
+        
+        # Resolve location using helper (A, C) - only if postcode missing/invalid
+        location_resolution = None
+        if not postcode_valid:
+            location_resolution = resolve_location_from_listing(
+                request.url,
+                address_text,
+                lat,
+                lon
+            )
+            
+            # Use resolved location if postcode is missing/invalid
+            if location_resolution['postcode'] and location_resolution['postcode_valid']:
+                # Use resolved postcode
+                postcode = location_resolution['postcode']
+                postcode_source = location_resolution['location_source']
+                postcode_valid = True
+                if "postcode" not in extracted_fields:
+                    extracted_fields.append("postcode")
+                # Update lat/lon if resolved
+                if location_resolution['lat'] and location_resolution['lon']:
+                    lat = location_resolution['lat']
+                    lon = location_resolution['lon']
+                    location_source = location_resolution['location_source']
+            elif location_resolution['lat'] and location_resolution['lon']:
+                # Use resolved lat/lon even if postcode not found
+                lat = location_resolution['lat']
+                lon = location_resolution['lon']
+                location_source = location_resolution['location_source']
+                warnings.extend(location_resolution['warnings'])
+            else:
+                warnings.append("Could not confidently extract a valid postcode; please enter manually.")
+        else:
+            # Postcode is valid, but update lat/lon if resolved location has better coordinates
+            if not lat or not lon:
+                location_resolution = resolve_location_from_listing(
+                    request.url,
+                    address_text,
+                    lat,
+                    lon
+                )
+                if location_resolution['lat'] and location_resolution['lon']:
+                    lat = location_resolution['lat']
+                    lon = location_resolution['lon']
+                    location_source = location_resolution['location_source']
+        
+        # Set inferred postcode and distance if used
+        if location_resolution:
+            inferred_postcode = location_resolution.get('postcode') if not postcode_valid else None
+            inferred_postcode_distance_m = location_resolution.get('location_precision_m')
+        else:
+            inferred_postcode = None
+            inferred_postcode_distance_m = None
+        
+        if postcode_valid:
+            if "postcode" not in extracted_fields:
+                extracted_fields.append("postcode")
+        
+        # Extract additional fields: bathrooms, floor_area_sqm, furnished
+        # Using layered approach: Key Facts > Embedded JS > Description
+        bathrooms = None
+        floor_area_sqm = None
+        furnished = None
+        extraction_methods = []  # Track which methods were used
+        
+        # Method A: Structured HTML Key Facts (preferred)
+        if 'rightmove.co.uk' in hostname:
+            key_facts_result = extract_from_key_facts(soup)
+            if key_facts_result['method'] == 'key_facts':
+                if key_facts_result['bathrooms'] is not None:
+                    bathrooms = key_facts_result['bathrooms']
+                    extracted_fields.append("bathrooms")
+                if key_facts_result['floor_area_sqm'] is not None:
+                    floor_area_sqm = key_facts_result['floor_area_sqm']
+                    extracted_fields.append("floor_area_sqm")
+                if key_facts_result['furnished'] is not None:
+                    furnished = key_facts_result['furnished']
+                    extracted_fields.append("furnished")
+                extraction_methods.append('key_facts')
+            
+            # Method B: Embedded JS (fallback)
+            if bathrooms is None or floor_area_sqm is None or furnished is None:
+                js_result = extract_from_embedded_js(html)
+                if js_result['method'] == 'embedded_js':
+                    if bathrooms is None and js_result['bathrooms'] is not None:
+                        bathrooms = js_result['bathrooms']
+                        extracted_fields.append("bathrooms")
+                    if floor_area_sqm is None and js_result['floor_area_sqm'] is not None:
+                        floor_area_sqm = js_result['floor_area_sqm']
+                        extracted_fields.append("floor_area_sqm")
+                    if furnished is None and js_result['furnished'] is not None:
+                        furnished = js_result['furnished']
+                        extracted_fields.append("furnished")
+                    if 'embedded_js' not in extraction_methods:
+                        extraction_methods.append('embedded_js')
+            
+            # Method C: Description text (lowest confidence)
+            if bathrooms is None or floor_area_sqm is None or furnished is None:
+                desc_result = extract_from_description(html)
+                if desc_result['method'] == 'description':
+                    if bathrooms is None and desc_result['bathrooms'] is not None:
+                        bathrooms = desc_result['bathrooms']
+                        extracted_fields.append("bathrooms")
+                    if floor_area_sqm is None and desc_result['floor_area_sqm'] is not None:
+                        floor_area_sqm = desc_result['floor_area_sqm']
+                        extracted_fields.append("floor_area_sqm")
+                    if furnished is None and desc_result['furnished'] is not None:
+                        furnished = desc_result['furnished']
+                        extracted_fields.append("furnished")
+                    if 'description' not in extraction_methods:
+                        extraction_methods.append('description')
+        
+        # Update parsing_confidence based on extraction methods
+        # high: price + beds + postcode + at least one of (bathrooms or size) from key_facts
+        # medium: price + beds + postcode + any additional fields from embedded_js
+        # low: anything relying on description or missing key fields
+        
+        has_key_fields = price_pcm and bedrooms and postcode
+        has_additional_from_key_facts = (bathrooms is not None or floor_area_sqm is not None) and 'key_facts' in extraction_methods
+        has_additional_from_js = (bathrooms is not None or floor_area_sqm is not None or furnished is not None) and 'embedded_js' in extraction_methods
+        used_description = 'description' in extraction_methods
+        
+        if has_key_fields and has_additional_from_key_facts:
+            # High confidence: key fields + additional from structured Key Facts
+            if parsing_confidence == "low":
+                parsing_confidence = "medium"
+            if parsing_confidence == "medium":
+                parsing_confidence = "high"
+        elif has_key_fields and has_additional_from_js and not used_description:
+            # Medium confidence: key fields + additional from embedded JS
+            if parsing_confidence == "low":
+                parsing_confidence = "medium"
+        elif used_description or not has_key_fields:
+            # Low confidence: used description method or missing key fields
+            parsing_confidence = "low"
+        
+    except requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Could not fetch listing: {str(e)}")
+    except Exception as e:
+        warnings.append(f"Extraction error: {str(e)}")
+    
+    # Extract portal assets (B)
+    image_urls = []
+    floorplan_url = None
+    asset_warnings = []
+    asset_extraction_confidence = "low"
+    
+    try:
+        if 'rightmove.co.uk' in hostname or 'zoopla.co.uk' in hostname:
+            # Extract images from multiple sources
+            jsonld_images = extract_image_urls_from_jsonld(html)
+            script_images = extract_image_urls_from_scripts(html)
+            
+            # Also check og:image and gallery img tags
+            soup = BeautifulSoup(html, 'html.parser')
+            og_image = soup.find('meta', property='og:image')
+            if og_image and og_image.get('content'):
+                jsonld_images.append(og_image['content'])
+            
+            # Get gallery images
+            gallery_imgs = soup.find_all('img', {'class': re.compile('gallery|photo|image', re.I)})
+            for img in gallery_imgs[:10]:  # Limit
+                src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+                if src and src.startswith('http'):
+                    script_images.append(src)
+            
+            # Combine and normalize
+            all_images = jsonld_images + script_images
+            image_urls = normalize_image_urls(all_images)
+            
+            # Extract floorplan
+            floorplan_url = extract_floorplan_url(html)
+            
+            # Determine confidence
+            if len(jsonld_images) > 0 and len(image_urls) >= 3:
+                asset_extraction_confidence = "high"
+            elif len(image_urls) >= 2:
+                asset_extraction_confidence = "medium"
+            else:
+                asset_extraction_confidence = "low"
+            
+            if len(image_urls) == 0:
+                asset_warnings.append("No listing images found")
+            if not floorplan_url:
+                asset_warnings.append("No floorplan found")
+    except Exception as e:
+        asset_warnings.append(f"Asset extraction error: {str(e)}")
+    
+    return ParseListingResponse(
+        price_pcm=price_pcm,
+        bedrooms=bedrooms,
+        property_type=property_type,
+        postcode=postcode,
+        postcode_valid=postcode_valid,
+        postcode_source=postcode_source,
+        postcode_candidates=postcode_candidates,
+        chosen_postcode_source=chosen_source,
+        bathrooms=bathrooms,
+        floor_area_sqm=floor_area_sqm,
+        furnished=furnished,
+        parsing_confidence=parsing_confidence,
+        extracted_fields=extracted_fields,
+        warnings=warnings,
+        image_urls=image_urls,
+        floorplan_url=floorplan_url,
+        asset_warnings=asset_warnings,
+        asset_extraction_confidence=asset_extraction_confidence,
+        lat=lat,
+        lon=lon,
+        location_source=location_source,
+        inferred_postcode=inferred_postcode,
+        inferred_postcode_distance_m=inferred_postcode_distance_m,
+        address_text=address_text,
+        location_precision_m=location_resolution.get('location_precision_m') if location_resolution else None
+    )
+
+class PhotoAnalysisResponse(BaseModel):
+    condition_score: int  # 0-100
+    condition_label: str  # "poor"|"ok"|"good"|"great"
+    warnings: List[str]
+
+# --- Portal Assets Analysis (C) ---
+class AnalyzeListingAssetsRequest(BaseModel):
+    url: str
+
+class ConditionAnalysis(BaseModel):
+    label: str  # "dated" | "average" | "modern" | "luxury"
+    score: int  # 0-100
+    confidence: str  # "low" | "medium" | "high"
+    signals: List[str]
+
+class FloorplanExtracted(BaseModel):
+    estimated_area_sqm: Optional[float] = None
+    layout_notes: List[str] = []
+    bedroom_count_hint: Optional[int] = None
+    bathroom_count_hint: Optional[int] = None
+
+class FloorplanAnalysis(BaseModel):
+    present: bool
+    confidence: str  # "low" | "medium" | "high"
+    extracted: FloorplanExtracted
+    warnings: List[str] = []
+
+class AssetsUsed(BaseModel):
+    photos_used: int
+    floorplan_used: bool
+
+class AnalyzeListingAssetsResponse(BaseModel):
+    condition: ConditionAnalysis
+    floorplan: FloorplanAnalysis
+    assets_used: AssetsUsed
+    warnings: List[str] = []
+
+@app.post("/analyze-listing-assets", response_model=AnalyzeListingAssetsResponse)
+async def analyze_listing_assets(request: AnalyzeListingAssetsRequest):
+    """Analyze listing photos and floorplan using AI vision."""
+    if not ENABLE_PORTAL_ASSETS:
+        raise HTTPException(status_code=400, detail="Portal assets disabled")
+    
+    if not openai_client:
+        raise HTTPException(status_code=500, detail="OpenAI client not configured")
+    
+    warnings = []
+    
+    try:
+        # Step 1: Parse listing to get asset URLs and HTML for photo selection (6)
+        parse_request = ParseListingRequest(url=request.url)
+        parse_response = await parse_listing(parse_request)
+        
+        # Fetch HTML for photo selection heuristic
+        html = ""
+        try:
+            response = requests.get(request.url, headers={'User-Agent': 'RentScope/1.0'}, timeout=8)
+            if response.ok:
+                html = response.text
+        except:
+            pass  # Continue without HTML if fetch fails
+        
+        # Improve photo selection: prioritize interior-like URLs (6)
+        all_image_urls = parse_response.image_urls
+        html_lower = html.lower() if html else ""
+        interior_keywords = ["kitchen", "bathroom", "living", "interior", "bedroom", "dining"]
+        
+        # Score images by proximity to interior keywords
+        image_scores = []
+        for url in all_image_urls:
+            score = 0
+            url_lower = url.lower()
+            # Avoid floorplan and map images
+            if "floorplan" in url_lower or "map" in url_lower:
+                score -= 10
+            # Avoid thumbnails
+            if "thumb" in url_lower or "small" in url_lower:
+                score -= 5
+            # Prefer larger images
+            if any(size in url_lower for size in ["large", "full", "1024", "1280", "1920"]):
+                score += 5
+            
+            # Check HTML context near image URL for interior keywords
+            try:
+                url_index = html_lower.find(url_lower[:50])  # Find URL in HTML
+                if url_index >= 0:
+                    context = html_lower[max(0, url_index-200):url_index+200]
+                    for keyword in interior_keywords:
+                        if keyword in context:
+                            score += 3
+            except:
+                pass
+            
+            image_scores.append((score, url))
+        
+        # Sort by score (descending) and take top 4
+        image_scores.sort(reverse=True, key=lambda x: x[0])
+        image_urls = [url for _, url in image_scores[:4]]
+        floorplan_url = parse_response.floorplan_url
+        
+        if not image_urls and not floorplan_url:
+            warnings.append("No images or floorplan found in listing")
+            return AnalyzeListingAssetsResponse(
+                condition=ConditionAnalysis(label="average", score=50, confidence="low", signals=[]),
+                floorplan=FloorplanAnalysis(present=False, confidence="low", extracted=FloorplanExtracted(), warnings=warnings),
+                assets_used=AssetsUsed(photos_used=0, floorplan_used=False),
+                warnings=warnings
+            )
+        
+        # Step 2: Download assets in-memory
+        photo_data = []
+        for url in image_urls:
+            data = safe_fetch_image(url)
+            if data:
+                photo_data.append(data)
+            else:
+                warnings.append(f"Could not download image: {url[:50]}...")
+        
+        floorplan_data = None
+        if floorplan_url:
+            floorplan_data = safe_fetch_image(floorplan_url)
+            if not floorplan_data:
+                warnings.append(f"Could not download floorplan: {floorplan_url[:50]}...")
+        
+        if not photo_data and not floorplan_data:
+            warnings.append("No assets could be downloaded")
+            return AnalyzeListingAssetsResponse(
+                condition=ConditionAnalysis(label="average", score=50, confidence="low", signals=[]),
+                floorplan=FloorplanAnalysis(present=bool(floorplan_data), confidence="low", extracted=FloorplanExtracted(), warnings=warnings),
+                assets_used=AssetsUsed(photos_used=0, floorplan_used=bool(floorplan_data)),
+                warnings=warnings
+            )
+        
+        # Step 3: Prepare images for OpenAI (base64 encode)
+        vision_images = []
+        for img_data in photo_data:
+            base64_img = base64.b64encode(img_data).decode('utf-8')
+            vision_images.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}
+            })
+        
+        if floorplan_data:
+            base64_floorplan = base64.b64encode(floorplan_data).decode('utf-8')
+            vision_images.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{base64_floorplan}"}
+            })
+        
+        # Step 4: Call OpenAI vision API
+        prompt = """Analyze these property listing images. Return a JSON object with this exact structure:
+{
+  "condition": {
+    "label": "dated" | "average" | "modern" | "luxury",
+    "score": 0-100,
+    "confidence": "low" | "medium" | "high",
+    "signals": ["short concrete signal 1", "signal 2", ...]
+  },
+  "floorplan": {
+    "present": true/false,
+    "confidence": "low" | "medium" | "high",
+    "extracted": {
+      "estimated_area_sqm": number or null,
+      "layout_notes": ["note 1", ...],
+      "bedroom_count_hint": number or null,
+      "bathroom_count_hint": number or null
+    },
+    "warnings": ["warning 1", ...]
+  }
+}
+
+Rules:
+- Do NOT infer location or address
+- For floorplan area: only extract if clearly printed/visible, else null
+- Keep signals short and concrete (e.g., "modern kitchen", "dated bathroom", "high ceilings")
+- If no floorplan visible, set floorplan.present=false
+- Be conservative with confidence levels"""
+
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        *vision_images
+                    ]}
+                ],
+                max_tokens=1000,
+                response_format={"type": "json_object"}
+            )
+            
+            result_text = response.choices[0].message.content
+            result_json = json.loads(result_text)
+            
+            # Parse response
+            condition_data = result_json.get("condition", {})
+            floorplan_data_result = result_json.get("floorplan", {})
+            
+            condition = ConditionAnalysis(
+                label=condition_data.get("label", "average"),
+                score=int(condition_data.get("score", 50)),
+                confidence=condition_data.get("confidence", "low"),
+                signals=condition_data.get("signals", [])
+            )
+            
+            floorplan_extracted = FloorplanExtracted(
+                estimated_area_sqm=floorplan_data_result.get("extracted", {}).get("estimated_area_sqm"),
+                layout_notes=floorplan_data_result.get("extracted", {}).get("layout_notes", []),
+                bedroom_count_hint=floorplan_data_result.get("extracted", {}).get("bedroom_count_hint"),
+                bathroom_count_hint=floorplan_data_result.get("extracted", {}).get("bathroom_count_hint")
+            )
+            
+            floorplan = FloorplanAnalysis(
+                present=floorplan_data_result.get("present", False),
+                confidence=floorplan_data_result.get("confidence", "low"),
+                extracted=floorplan_extracted,
+                warnings=floorplan_data_result.get("warnings", [])
+            )
+            
+            return AnalyzeListingAssetsResponse(
+                condition=condition,
+                floorplan=floorplan,
+                assets_used=AssetsUsed(photos_used=len(photo_data), floorplan_used=bool(floorplan_data)),
+                warnings=warnings
+            )
+            
+        except Exception as e:
+            warnings.append(f"OpenAI API error: {str(e)}")
+            return AnalyzeListingAssetsResponse(
+                condition=ConditionAnalysis(label="average", score=50, confidence="low", signals=[]),
+                floorplan=FloorplanAnalysis(present=bool(floorplan_data), confidence="low", extracted=FloorplanExtracted(), warnings=warnings),
+                assets_used=AssetsUsed(photos_used=len(photo_data), floorplan_used=bool(floorplan_data)),
+                warnings=warnings
+            )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
+
+@app.post("/analyze-photos", response_model=PhotoAnalysisResponse)
+async def analyze_photos(files: List[UploadFile] = File(...)):
+    """
+    Analyze property photos to estimate condition.
+    TODO: Integrate a real vision model here (e.g., fine-tuned ResNet, CLIP, or commercial API).
+    For now, returns a placeholder stub.
+    """
+    if len(files) > 6:
+        raise HTTPException(status_code=400, detail="Maximum 6 images allowed")
+    
+    # Validate file types
+    allowed_types = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
+    for file in files:
+        if file.content_type not in allowed_types:
+            raise HTTPException(status_code=400, detail=f"Invalid file type: {file.content_type}. Allowed: jpg, png, webp")
+    
+    # TODO: Implement actual vision model here
+    # Example integration points:
+    # 1. Load images: from PIL import Image; img = Image.open(io.BytesIO(await file.read()))
+    # 2. Preprocess for model
+    # 3. Run inference
+    # 4. Aggregate scores across multiple images
+    # 5. Map to condition_score (0-100) and condition_label
+    
+    # Placeholder implementation
+    return PhotoAnalysisResponse(
+        condition_score=50,
+        condition_label="ok",
+        warnings=["Photo analysis is beta and currently uses a placeholder model."]
+    )
 
 @app.get("/debug/comps")
 async def debug_comps(

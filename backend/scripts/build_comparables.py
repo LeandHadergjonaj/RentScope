@@ -9,6 +9,8 @@ import os
 import sys
 from datetime import datetime, timedelta
 import re
+import math
+import numpy as np
 
 def normalize_property_type(prop_type: str) -> str:
     """Normalize property type to flat|house|studio|room"""
@@ -67,6 +69,52 @@ def parse_size_sqm(size_str: str) -> float:
     else:
         # Assume sq ft if no unit specified
         return size_value * 0.092903
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate distance between two lat/lon points in meters using Haversine formula."""
+    R = 6371000  # Earth radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    
+    a = math.sin(delta_phi / 2) ** 2 + \
+        math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    
+    return R * c
+
+def infer_representative_postcode(district_lat: float, district_lon: float, postcode_lookup: pd.DataFrame) -> tuple:
+    """
+    Infer representative postcode for a district centroid.
+    Returns (postcode, ladcd, dist_m) or (None, None, None) if not found.
+    """
+    if pd.isna(district_lat) or pd.isna(district_lon):
+        return (None, None, None)
+    
+    # Filter to valid postcodes with lat/lon
+    valid_postcodes = postcode_lookup[
+        postcode_lookup['lat'].notna() & postcode_lookup['lon'].notna()
+    ].copy()
+    
+    if len(valid_postcodes) == 0:
+        return (None, None, None)
+    
+    # Compute distances (vectorized)
+    valid_postcodes['dist_m'] = valid_postcodes.apply(
+        lambda row: haversine_distance(district_lat, district_lon, row['lat'], row['lon']),
+        axis=1
+    )
+    
+    # Find nearest
+    nearest_idx = valid_postcodes['dist_m'].idxmin()
+    nearest_row = valid_postcodes.loc[nearest_idx]
+    
+    postcode = str(nearest_row['postcode']).strip() if pd.notna(nearest_row['postcode']) else None
+    ladcd = str(nearest_row['ladcd']).strip() if pd.notna(nearest_row['ladcd']) else None
+    dist_m = float(nearest_row['dist_m'])
+    
+    return (postcode, ladcd, dist_m)
 
 def extract_district_from_address(address: str) -> str:
     """Extract district code from address string"""
@@ -134,6 +182,19 @@ def main():
     
     print(f"Created {len(district_centroids)} district centroids")
     
+    # Infer representative postcode for each district (D)
+    print("Inferring representative postcodes for districts...")
+    rep_postcode_results = district_centroids.apply(
+        lambda row: infer_representative_postcode(row['district_lat'], row['district_lon'], postcode_lookup),
+        axis=1,
+        result_type='expand'
+    )
+    district_centroids['rep_postcode'] = rep_postcode_results[0]
+    district_centroids['rep_ladcd'] = rep_postcode_results[1]
+    district_centroids['rep_dist_m'] = rep_postcode_results[2]
+    
+    print(f"Inferred postcodes for {district_centroids['rep_postcode'].notna().sum()} districts")
+    
     print("\n" + "=" * 60)
     print("Ingesting Rental Ads Data")
     print("=" * 60)
@@ -188,6 +249,17 @@ def main():
     df["lat"] = df["district_lat"]
     df["lon"] = df["district_lon"]
     
+    # Add representative postcode and district (D)
+    df = df.merge(
+        district_centroids[["district", "rep_postcode"]],
+        on="district",
+        how="left"
+    )
+    df["postcode"] = df["rep_postcode"]
+    df["postcode_district"] = df["district"]
+    df["location_precision"] = "district_centroid"
+    df = df.drop(columns=["rep_postcode"])  # Clean up
+    
     # Set dates (today-30d and today)
     today = datetime.now()
     first_seen_default = (today - timedelta(days=30)).strftime("%Y-%m-%d")
@@ -213,7 +285,7 @@ def main():
     print(f"After bedroom filter (0 <= bedrooms <= 10): {len(df)} rows (dropped {initial_count - len(df)})")
     
     # Ensure required columns exist
-    required_cols = ["price_pcm", "bedrooms", "bathrooms", "property_type", "lat", "lon", "first_seen", "last_seen"]
+    required_cols = ["price_pcm", "bedrooms", "bathrooms", "property_type", "lat", "lon", "first_seen", "last_seen", "postcode", "postcode_district", "location_precision"]
     optional_cols = ["furnished", "floor_area_sqm"]
     
     # Select and order columns

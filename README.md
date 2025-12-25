@@ -45,10 +45,27 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
-5. Run the backend server:
+5. Configure environment variables (optional, for portal assets analysis):
+```bash
+# Copy the example file
+cp .env.example .env
+
+# Edit .env and add your OpenAI API key:
+    # OPENAI_API_KEY=sk-your-actual-key-here
+    # ENABLE_PORTAL_ASSETS=true
+    # ENABLE_GEOCODING=true
+    ```
+
+    **Note:** 
+    - Portal assets analysis (AI vision for photos/floorplans) requires an OpenAI API key. If you don't need this feature, you can skip this step.
+    - Geocoding (address→postcode resolution) uses OpenStreetMap Nominatim. Set `ENABLE_GEOCODING=true` to enable. This is optional but improves location accuracy when portals don't show postcodes.
+
+6. Run the backend server:
 ```bash
 uvicorn main:app --reload --port 8000
 ```
+
+**Important:** If `ENABLE_PORTAL_ASSETS=true` is set in `.env` but `OPENAI_API_KEY` is missing, the server will fail to start with a clear error message.
 
 The backend will be available at `http://localhost:8000`
 
