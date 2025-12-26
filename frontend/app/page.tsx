@@ -32,8 +32,9 @@ const fmtInt = (n?: number | null): string => {
 
 interface PostcodeCandidate {
   value: string
-  source: 'jsonld' | 'script' | 'regex'
+  source: 'jsonld' | 'script' | 'regex' | 'address_text' | 'latlon_inferred' | 'unknown'
   valid: boolean
+  distance_m?: number | null
 }
 
 interface ParseListingResponse {
@@ -68,6 +69,11 @@ interface ParseListingResponse {
   has_terrace?: boolean | null
   has_concierge?: boolean | null
   parsed_feature_warnings?: string[]
+  // Portal assets (B)
+  image_urls?: string[]
+  floorplan_url?: string | null
+  asset_warnings?: string[]
+  asset_extraction_confidence?: 'high' | 'medium' | 'low'
   // Debug output (only when debug=true)
   debug_raw?: {
     url?: string
@@ -1109,6 +1115,14 @@ export default function Home() {
                           </label>
                         </div>
                         <DebugPanel result={result} fmt={fmt} fmtInt={fmtInt} assetAnalysis={assetAnalysis} />
+                        
+                        {/* Debug Section: Raw JSON + Key Fields */}
+                        <DebugSection 
+                          parseResult={fullParseResult}
+                          evaluateResult={result}
+                          fmt={fmt}
+                          fmtInt={fmtInt}
+                        />
                       </div>
                     </Accordion>
                   )}
@@ -1182,6 +1196,268 @@ function StatBadge({ label, tone }: { label: string; tone: "good" | "warn" | "ba
     <span className={`inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold ${toneStyles[tone]}`}>
       {label}
     </span>
+  )
+}
+
+// Debug Section Component
+function DebugSection({ 
+  parseResult, 
+  evaluateResult, 
+  fmt, 
+  fmtInt 
+}: { 
+  parseResult: any
+  evaluateResult: any
+  fmt: (n?: number | null, d?: number) => string
+  fmtInt: (n?: number | null) => string
+}) {
+  const copyToClipboard = (text: string, label: string) => {
+    navigator.clipboard.writeText(text).then(() => {
+      // Show temporary success message
+      const button = document.getElementById(`copy-${label}`)
+      if (button) {
+        const originalText = button.textContent
+        button.textContent = 'Copied!'
+        setTimeout(() => {
+          if (button) button.textContent = originalText
+        }, 2000)
+      }
+    }).catch(err => {
+      console.error('Failed to copy:', err)
+    })
+  }
+
+  const renderJsonBlock = (data: any, label: string) => {
+    if (!data) return null
+    
+    const jsonString = JSON.stringify(data, null, 2)
+    
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-semibold text-stone-900">Raw JSON</span>
+          <button
+            id={`copy-${label}`}
+            onClick={() => copyToClipboard(jsonString, label)}
+            className="text-xs px-2 py-1 rounded border border-stone-300 bg-white text-stone-700 hover:bg-stone-50 transition-colors"
+          >
+            Copy
+          </button>
+        </div>
+        <pre className="bg-stone-50 border border-stone-200 rounded-lg p-3 text-[10px] font-mono text-stone-800 overflow-x-auto max-h-96 overflow-y-auto">
+          {jsonString}
+        </pre>
+      </div>
+    )
+  }
+
+  const renderKeyFields = () => {
+    if (!evaluateResult) return null
+
+    const modelComponents = evaluateResult.debug?.model_components || {}
+    
+    const fields = [
+      // Comparables
+      { label: 'Comps Used', value: modelComponents.comps_used ? 'Yes' : 'No' },
+      { label: 'Comps Sample Size', value: modelComponents.comps_sample_size ?? '—' },
+      { label: 'Comps n_eff', value: modelComponents.comps_neff != null ? fmt(modelComponents.comps_neff, 1) : '—' },
+      { label: 'Comps Radius (m)', value: modelComponents.comps_radius_m != null ? fmt(modelComponents.comps_radius_m, 0) : '—' },
+      { label: 'Comps Source', value: modelComponents.comps_source || '—' },
+      { label: 'Comps DB Count Recent', value: modelComponents.comps_db_count_recent ?? '—' },
+      { label: 'Comps Top10 Weight Share', value: modelComponents.comps_top10_weight_share != null ? fmt(modelComponents.comps_top10_weight_share, 3) : '—' },
+      { label: 'Comps Weighted Quantiles', value: modelComponents.comps_weighted_quantiles_used || '—' },
+      
+      // Similarity
+      { label: 'Strong Similarity', value: modelComponents.strong_similarity ? 'Yes' : 'No' },
+      { label: 'Similarity Ratio', value: modelComponents.similarity_ratio != null ? fmt(modelComponents.similarity_ratio, 3) : '—' },
+      { label: 'Similarity Rules Applied', value: Array.isArray(modelComponents.similarity_rules_applied) ? modelComponents.similarity_rules_applied.join(', ') || 'None' : '—' },
+      { label: 'Similarity Uses Area', value: modelComponents.similarity_uses_area ? 'Yes' : 'No' },
+      
+      // Models
+      { label: 'ONS Used', value: modelComponents.ons_used ? 'Yes' : 'No' },
+      { label: 'ML Used', value: modelComponents.ml_used ? 'Yes' : 'No' },
+      { label: 'ML MAE', value: modelComponents.ml_mae != null ? `£${fmt(modelComponents.ml_mae, 2)}/mo` : '—' },
+      { label: 'ML Expected Median', value: modelComponents.ml_expected_median_pcm != null ? `£${fmt(modelComponents.ml_expected_median_pcm, 2)}/mo` : '—' },
+      
+      // Area
+      { label: 'Area Used', value: modelComponents.area_used ? 'Yes' : 'No' },
+      { label: 'Area Source', value: modelComponents.area_source || '—' },
+      { label: 'Area Used (sqm)', value: modelComponents.area_used_sqm != null ? fmt(modelComponents.area_used_sqm, 1) : '—' },
+      { label: 'Floorplan Used', value: modelComponents.floorplan_used ? 'Yes' : 'No' },
+      
+      // Location (from parse result or evaluate result)
+      { label: 'Postcode', value: parseResult?.postcode || '—' },
+      { label: 'Postcode Valid', value: parseResult?.postcode_valid != null ? (parseResult.postcode_valid ? 'Yes' : 'No') : '—' },
+      { label: 'Postcode Source', value: parseResult?.postcode_source || '—' },
+      { label: 'Location Source', value: evaluateResult?.debug?.location_source || parseResult?.location_source || '—' },
+      { label: 'Address Text', value: parseResult?.address_text || '—' },
+      { label: 'Lat', value: parseResult?.lat != null ? fmt(parseResult.lat, 6) : '—' },
+      { label: 'Lon', value: parseResult?.lon != null ? fmt(parseResult.lon, 6) : '—' },
+    ]
+
+    return (
+      <div className="space-y-2">
+        <div className="text-xs font-semibold text-stone-900 mb-2">Key Debug Fields</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+          {fields.map((field, idx) => (
+            <div key={idx} className="flex items-start gap-2 text-xs">
+              <span className="font-medium text-stone-600 min-w-[140px]">{field.label}:</span>
+              <span className="font-mono text-stone-800 break-words">{field.value}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-4 pt-4 border-t border-stone-200">
+      {/* Debug Parse */}
+      <Accordion title="Debug Parse (raw JSON)">
+        <div className="p-4 space-y-4">
+          {parseResult ? (
+            <>
+              {/* Postcode Resolution Section */}
+              {(parseResult.postcode || parseResult.postcode_candidates?.length > 0) && (
+                <div className="space-y-3">
+                  <div className="text-xs font-semibold text-stone-900">Postcode Resolution</div>
+                  
+                  {/* Chosen postcode */}
+                  {parseResult.postcode && (
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="font-medium text-stone-600">Chosen:</span>
+                      <span className="font-mono text-stone-800">{parseResult.postcode}</span>
+                      {parseResult.postcode_source && (
+                        <span className="text-stone-500">({parseResult.postcode_source})</span>
+                      )}
+                    </div>
+                  )}
+                  
+                  {/* Postcode candidates table */}
+                  {parseResult.postcode_candidates && parseResult.postcode_candidates.length > 0 && (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs border border-stone-200 rounded-lg">
+                        <thead className="bg-stone-50">
+                          <tr>
+                            <th className="px-3 py-2 text-left font-semibold text-stone-700 border-b border-stone-200">Value</th>
+                            <th className="px-3 py-2 text-left font-semibold text-stone-700 border-b border-stone-200">Source</th>
+                            <th className="px-3 py-2 text-left font-semibold text-stone-700 border-b border-stone-200">Valid</th>
+                            <th className="px-3 py-2 text-left font-semibold text-stone-700 border-b border-stone-200">Distance (m)</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {parseResult.postcode_candidates.map((candidate: PostcodeCandidate, idx: number) => (
+                            <tr key={idx} className="border-b border-stone-100 last:border-b-0">
+                              <td className="px-3 py-2 font-mono text-stone-800">{candidate.value || '—'}</td>
+                              <td className="px-3 py-2 text-stone-700">{candidate.source || '—'}</td>
+                              <td className="px-3 py-2">
+                                <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                                  candidate.valid 
+                                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' 
+                                    : 'bg-rose-50 text-rose-700 border border-rose-200'
+                                }`}>
+                                  {candidate.valid ? 'Yes' : 'No'}
+                                </span>
+                              </td>
+                              <td className="px-3 py-2 font-mono text-stone-800">
+                                {candidate.distance_m != null ? Math.round(candidate.distance_m) : '—'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  
+                  {/* Warnings */}
+                  {parseResult.warnings && parseResult.warnings.length > 0 && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 p-3">
+                      <div className="text-xs font-semibold text-amber-800 mb-1">Warnings</div>
+                      <ul className="text-xs text-amber-700 space-y-1">
+                        {parseResult.warnings.map((warning: string, idx: number) => (
+                          <li key={idx} className="list-disc list-inside">{warning}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+              
+              {/* Assets Section */}
+              {(parseResult.image_urls || parseResult.floorplan_url || parseResult.asset_extraction_confidence) && (
+                <div className="space-y-3 pt-4 border-t border-stone-200">
+                  <div className="text-xs font-semibold text-stone-900">Assets</div>
+                  
+                  <div className="grid grid-cols-2 gap-3 text-xs">
+                    <div>
+                      <span className="font-medium text-stone-600">Image URLs:</span>
+                      <span className="ml-2 font-mono text-stone-800">
+                        {parseResult.image_urls?.length ?? 0}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="font-medium text-stone-600">Floorplan URL:</span>
+                      <span className="ml-2 font-mono text-stone-800">
+                        {parseResult.floorplan_url ? 'Present' : 'None'}
+                      </span>
+                    </div>
+                  </div>
+                  
+                  {/* Asset extraction confidence badge */}
+                  {parseResult.asset_extraction_confidence && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium text-stone-600">Confidence:</span>
+                      <span className={`inline-flex items-center rounded-full px-2 py-1 text-xs font-medium ${
+                        parseResult.asset_extraction_confidence === 'high'
+                          ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                          : parseResult.asset_extraction_confidence === 'medium'
+                          ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                          : 'bg-rose-50 text-rose-700 border border-rose-200'
+                      }`}>
+                        {parseResult.asset_extraction_confidence}
+                      </span>
+                    </div>
+                  )}
+                  
+                  {/* Warning if assets found but confidence is low */}
+                  {parseResult.asset_extraction_confidence === 'low' && 
+                   (parseResult.floorplan_url || (parseResult.image_urls && parseResult.image_urls.length > 0)) && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 p-2">
+                      <span className="text-xs text-amber-700 font-medium">
+                        ⚠️ Assets found but confidence is low — check extractor.
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+              
+              {/* Raw JSON Block */}
+              {renderJsonBlock(parseResult, 'parse')}
+            </>
+          ) : (
+            <p className="text-xs text-stone-500 italic">No parse result available. Run "Extract details" first.</p>
+          )}
+        </div>
+      </Accordion>
+
+      {/* Debug Eval */}
+      <Accordion title="Debug Eval (raw JSON)">
+        <div className="p-4 space-y-4">
+          {evaluateResult ? (
+            renderJsonBlock(evaluateResult, 'eval')
+          ) : (
+            <p className="text-xs text-stone-500 italic">No evaluation result available. Run evaluation first.</p>
+          )}
+        </div>
+      </Accordion>
+
+      {/* Key Debug Fields */}
+      <Accordion title="Key Debug Fields (human readable)">
+        <div className="p-4">
+          {renderKeyFields()}
+        </div>
+      </Accordion>
+    </div>
   )
 }
 

@@ -791,9 +791,9 @@ class DebugInfo(BaseModel):
     quality_label: str  # "poor"|"ok"|"good"|"great"
     quality_reasons: List[str]
     model_components: Dict[str, Any]
-    location_source: Optional[str] = None
-    location_precision_m: Optional[float] = None
-    geocoding_used: Optional[bool] = None
+    location_source: str = "none"  # Never null, defaults to "none" (3)
+    location_precision_m: float = 0.0  # Never null, defaults to 0.0 (3)
+    geocoding_used: bool = False  # Never null, defaults to False (3)
 
 class EvaluateResponse(BaseModel):
     borough: str
@@ -1021,11 +1021,16 @@ async def evaluate_property(request: EvaluateRequest):
     ladcd = None
     postcode_inferred = False
     inferred_postcode_dist_m = None
+    # Track location resolution path for debug (2)
+    location_resolution_source = "none"  # "listing_latlon" | "inferred" | "postcode_lookup" | "nominatim" | "none"
+    location_resolution_precision_m = 0.0
+    geocoding_used = False
     
     # If lat/lon provided, use them directly
     if request.lat is not None and request.lon is not None:
         lat = float(request.lat)
         lon = float(request.lon)
+        location_resolution_source = "listing_latlon"  # Track that lat/lon was provided (2)
         
         # Infer postcode from lat/lon if postcode missing or invalid
         if not request.postcode or not request.postcode.strip():
@@ -1035,6 +1040,8 @@ async def evaluate_property(request: EvaluateRequest):
                 ladcd = inferred_result.get('ladcd')
                 postcode_inferred = True
                 inferred_postcode_dist_m = inferred_result.get('dist_m')
+                location_resolution_source = "inferred"  # Postcode was inferred (2)
+                location_resolution_precision_m = float(inferred_postcode_dist_m) if inferred_postcode_dist_m else 0.0
             else:
                 raise HTTPException(status_code=400, detail="Could not infer postcode from coordinates — cannot evaluate.")
         else:
@@ -1051,6 +1058,7 @@ async def evaluate_property(request: EvaluateRequest):
             
             if not postcode_row.empty:
                 ladcd = str(postcode_row.iloc[0]["ladcd"]).strip() if pd.notna(postcode_row.iloc[0]["ladcd"]) else None
+                # Postcode was provided and validated, keep "listing_latlon" as source
             else:
                 # Postcode not found, try to infer
                 inferred_result = infer_postcode_from_latlon(lat, lon)
@@ -1059,6 +1067,8 @@ async def evaluate_property(request: EvaluateRequest):
                     ladcd = inferred_result.get('ladcd')
                     postcode_inferred = True
                     inferred_postcode_dist_m = inferred_result.get('dist_m')
+                    location_resolution_source = "inferred"  # Postcode was inferred (2)
+                    location_resolution_precision_m = float(inferred_postcode_dist_m) if inferred_postcode_dist_m else 0.0
     
     # If no lat/lon but postcode provided, lookup lat/lon from postcode
     elif request.postcode and request.postcode.strip():
@@ -1078,6 +1088,9 @@ async def evaluate_property(request: EvaluateRequest):
         lat = float(postcode_row.iloc[0]["lat"])
         lon = float(postcode_row.iloc[0]["lon"])
         ladcd = str(postcode_row.iloc[0]["ladcd"]).strip() if pd.notna(postcode_row.iloc[0]["ladcd"]) else None
+        location_resolution_source = "postcode_lookup"  # Track that postcode was used to lookup lat/lon (2)
+        # Precision is 0 for postcode lookup (exact match)
+        location_resolution_precision_m = 0.0
     else:
         # Neither postcode nor lat/lon provided
         raise HTTPException(status_code=400, detail="Need postcode or lat/lon to evaluate.")
@@ -1214,6 +1227,7 @@ async def evaluate_property(request: EvaluateRequest):
     # Step 6.5: Try to get comparables estimate (6 - DB KNN first, CSV fallback)
     comps_used = False
     comps_sample_size = 0
+    comps_neff = 0.0  # Effective sample size (n_eff)
     comps_radius_m = 0.0
     comps_expected_median = 0.0
     comps_expected_range = [0.0, 0.0]
@@ -1223,6 +1237,8 @@ async def evaluate_property(request: EvaluateRequest):
     similarity_ratio = 0.0
     comps_source = "none"  # "db" | "csv" | "none"
     comps_db_count_recent = 0
+    comps_top10_weight_share = 0.0
+    comps_weighted_quantiles_used = "none"
     
     # Try DB KNN first (6)
     if lat and lon:
@@ -1257,18 +1273,22 @@ async def evaluate_property(request: EvaluateRequest):
                         weight_threshold=0.01
                     )
                     
-                    if db_result["comps_used"] and db_result["sample_size"] >= 12:
+                    # Use n_eff >= 10 instead of sample_size >= 12 (2)
+                    if db_result["comps_used"] and db_result.get("comps_neff", db_result["sample_size"]) >= 10.0:
                         break
                 
                 if db_result and db_result["comps_used"]:
                     comps_used = True
                     comps_sample_size = db_result["sample_size"]
+                    comps_neff = db_result.get("comps_neff", float(comps_sample_size))  # Use n_eff from KNN
                     comps_radius_m = db_result["radius_m"]
                     comps_expected_median = db_result["comps_estimate_pcm"]
                     comps_expected_range = db_result["comps_range_pcm"]
                     strong_similarity = db_result["strong_similarity"]
                     similarity_ratio = db_result["similarity_ratio"]
                     comps_source = "db"
+                    comps_top10_weight_share = db_result.get("comps_top10_weight_share", 0.0)
+                    comps_weighted_quantiles_used = db_result.get("comps_weighted_quantiles_used", "none")
         except Exception as e:
             # Fall back to CSV if DB fails
             pass
@@ -1286,6 +1306,11 @@ async def evaluate_property(request: EvaluateRequest):
             comps_expected_median, comps_expected_range = compute_comps_estimate(comps_selected)
             comps_used = True
             comps_sample_size = int(len(comps_selected))
+            # For CSV fallback, estimate n_eff (approximate: use sample_size as baseline)
+            comps_neff = float(comps_sample_size)  # CSV doesn't have weights, so n_eff ≈ sample_size
+            comps_top10_weight_share = 0.0  # Not computed for CSV
+            comps_weighted_quantiles_used = "25-75"  # Default for CSV
+            comps_source = "csv"  # Set comps_source when CSV comps are used (1)
             
             # Compute improved similarity strength score (5)
             # A comparable is "similar" if:
@@ -1673,9 +1698,10 @@ async def evaluate_property(request: EvaluateRequest):
             (postcode_inferred and inferred_postcode_dist_m and inferred_postcode_dist_m <= 500)
         )
         
+        # Use n_eff instead of raw sample_size for gates (4)
         evidence_gates = {
             'comps_used': comps_used,
-            'sample_size': comps_sample_size >= 20,
+            'sample_size': comps_neff >= 18.0,  # Use n_eff >= 18 instead of sample_size >= 20
             'radius': comps_radius_m <= 800,
             'strong_similarity': strong_similarity,
             'location_precision': postcode_valid_check or (request.lat is not None and request.lon is not None),
@@ -1724,14 +1750,14 @@ async def evaluate_property(request: EvaluateRequest):
                 sigma = 1.4826 * mad if mad > 0 else 0.0
                 relative_sigma = sigma / median_comp if median_comp > 0 else 0.0
                 
-                # Step 3: Determine tightness (B.7, 7 - evidence-based tightness, tighter for DB comps)
-                if comps_source == "db" and strong_similarity and comps_radius_m <= 800 and comps_sample_size >= 20:
+                # Step 3: Determine tightness using n_eff instead of sample_size (4)
+                if comps_source == "db" and strong_similarity and comps_radius_m <= 800 and comps_neff >= 18.0:
                     # Strong DB evidence: aim ±3.5% to ±5%
                     width_pct = max(0.035, min(0.05, 1.0 * relative_sigma))
-                elif strong_similarity and comps_radius_m <= 800 and comps_sample_size >= 20:
+                elif strong_similarity and comps_radius_m <= 800 and comps_neff >= 18.0:
                     # Strong evidence: aim ±3.5% to ±5%
                     width_pct = max(0.035, min(0.05, 1.0 * relative_sigma))
-                elif comps_radius_m <= 1200 and comps_sample_size >= 15:
+                elif comps_radius_m <= 1200 and comps_neff >= 15.0:
                     # Medium evidence: ±8%
                     width_pct = 0.08
                 else:
@@ -1742,16 +1768,16 @@ async def evaluate_property(request: EvaluateRequest):
                 if confidence == "low":
                     width_pct = max(width_pct, 0.07)
                 
-                # Step 4: Compute most_likely_range
-                if comps_sample_size >= 12:  # Always compute if we have enough comps
+                # Step 4: Compute most_likely_range using n_eff (4)
+                if comps_neff >= 10.0:  # Use n_eff >= 10 instead of sample_size >= 12
                     most_likely_low = expected_median * (1 - width_pct)
                     most_likely_high = expected_median * (1 + width_pct)
                     most_likely_range_pcm = [float(most_likely_low), float(most_likely_high)]
                     
-                    # Step 6: Set basis string
-                    if strong_similarity and comps_radius_m <= 800 and comps_sample_size >= 20:
+                    # Step 6: Set basis string using n_eff
+                    if strong_similarity and comps_radius_m <= 800 and comps_neff >= 18.0:
                         most_likely_range_basis = "tight range (strong local evidence)"
-                    elif comps_radius_m <= 1200 and comps_sample_size >= 15:
+                    elif comps_radius_m <= 1200 and comps_neff >= 15.0:
                         most_likely_range_basis = "standard range (moderate local evidence)"
                     else:
                         most_likely_range_basis = "wider range (limited local evidence)"
@@ -1768,19 +1794,11 @@ async def evaluate_property(request: EvaluateRequest):
         ml_used=ml_expected_median is not None
     )
     
-    # Determine location source and precision from request (F)
-    location_source_debug = "none"
-    location_precision_m_debug = None
-    geocoding_used_debug = False
-    
-    if request.lat is not None and request.lon is not None:
-        # Check if this came from parse-listing (would have location_source in response)
-        # For now, infer from context
-        location_source_debug = "provided"
-        # Try to infer precision if we can
-        if postcode_inferred and inferred_postcode_dist_m:
-            location_precision_m_debug = inferred_postcode_dist_m
-            location_source_debug = "inferred"
+    # Determine location source and precision from request (2)
+    # Use the tracked location resolution path
+    location_source_debug = location_resolution_source if location_resolution_source != "none" else "none"
+    location_precision_m_debug = location_resolution_precision_m if location_resolution_precision_m > 0 else 0.0
+    geocoding_used_debug = geocoding_used  # Geocoding is only used in /parse-listing, not /evaluate
     
     debug_info = DebugInfo(
         estimate_quality_score=quality_score,
@@ -1791,6 +1809,7 @@ async def evaluate_property(request: EvaluateRequest):
             "comps_used": comps_used,
             "ml_used": ml_expected_median is not None,
             "comps_sample_size": comps_sample_size,
+            "comps_neff": float(comps_neff),  # Effective sample size (5)
             "comps_radius_m": comps_radius_m,
             "strong_similarity": strong_similarity,
             "similarity_ratio": float(similarity_ratio),  # Always ensure it's a float
@@ -1803,12 +1822,14 @@ async def evaluate_property(request: EvaluateRequest):
             "portal_assets_used": bool(request.photo_condition_label or request.floorplan_area_sqm),
             "photos_used": photos_used_count if 'photos_used_count' in locals() else (1 if request.photo_condition_label else 0),
             "floorplan_used": bool(floorplan_used),
-            "comps_source": comps_source if 'comps_source' in locals() else "none",  # (8)
-            "comps_db_count_recent": comps_db_count_recent if 'comps_db_count_recent' in locals() else 0
+            "comps_source": comps_source,  # Always set: "db" | "csv" | "none" (1)
+            "comps_db_count_recent": comps_db_count_recent if 'comps_db_count_recent' in locals() else 0,
+            "comps_top10_weight_share": float(comps_top10_weight_share),  # (5)
+            "comps_weighted_quantiles_used": comps_weighted_quantiles_used  # (5)
         },
-        location_source=location_source_debug if location_source_debug != "none" else None,
-        location_precision_m=float(location_precision_m_debug) if location_precision_m_debug is not None else None,
-        geocoding_used=geocoding_used_debug if geocoding_used_debug else None
+        location_source=location_source_debug,  # Never null, defaults to "none" (3)
+        location_precision_m=float(location_precision_m_debug),  # Never null, defaults to 0.0 (3)
+        geocoding_used=bool(geocoding_used_debug)  # Never null, defaults to False (3)
     )
     
     return EvaluateResponse(
