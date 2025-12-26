@@ -195,6 +195,46 @@ def get_quality_adjustment(quality: Optional[str]) -> float:
     else:  # "average" or None
         return 0.00
 
+def get_amenities_adjustment(
+    has_lift: Optional[bool],
+    has_parking: Optional[bool],
+    has_balcony: Optional[bool],
+    has_terrace: Optional[bool],
+    has_concierge: Optional[bool],
+    property_type: str
+) -> float:
+    """
+    Get amenities adjustment factor.
+    Small additive adjustments: +0.01 lift, +0.01 balcony, +0.015 terrace, +0.015 concierge, +0.01 parking.
+    Cap total to ±0.05.
+    """
+    total_adj = 0.0
+    
+    # Lift: +0.01 (only for flats)
+    if has_lift is True and property_type.lower() == "flat":
+        total_adj += 0.01
+    
+    # Parking: +0.01
+    if has_parking is True:
+        total_adj += 0.01
+    
+    # Balcony: +0.01 (only if terrace is not True)
+    if has_balcony is True and has_terrace is not True:
+        total_adj += 0.01
+    
+    # Terrace: +0.015 (if terrace, don't add balcony)
+    if has_terrace is True:
+        total_adj += 0.015
+    
+    # Concierge: +0.015
+    if has_concierge is True:
+        total_adj += 0.015
+    
+    # Cap total amenities adjustment to ±0.05
+    total_adj = max(-0.05, min(0.05, total_adj))
+    
+    return total_adj
+
 def select_comparables(
     subject_lat: float,
     subject_lon: float,
@@ -785,6 +825,12 @@ class EvaluateRequest(BaseModel):
     lon: Optional[float] = None
     # Comparables DB (5)
     save_as_comparable: bool = True  # Default true for auto-building DB
+    # Amenities (3)
+    has_lift: Optional[bool] = None
+    has_parking: Optional[bool] = None
+    has_balcony: Optional[bool] = None
+    has_terrace: Optional[bool] = None
+    has_concierge: Optional[bool] = None
 
 class DebugInfo(BaseModel):
     estimate_quality_score: int
@@ -1367,7 +1413,9 @@ async def evaluate_property(request: EvaluateRequest):
                         similarity_rules_applied.extend(comp_rules)
             
             similarity_ratio = float(similar_count / len(comps_selected) if len(comps_selected) > 0 else 0.0)
-            strong_similarity = bool(similarity_ratio >= 0.6)
+            total = len(comps_selected)
+            # strong_similarity requires similarity_ratio >= 0.60, total >= 20, and radius <= 1200m
+            strong_similarity = bool(similarity_ratio >= 0.60 and total >= 20 and comps_radius_m <= 1200)
             
             # Deduplicate rules for debug
             similarity_rules_applied = list(set(similarity_rules_applied))
@@ -1503,7 +1551,7 @@ async def evaluate_property(request: EvaluateRequest):
     expected_lower_after_transport = expected_lower_base * (1 + transport_adjustment_pct)
     expected_upper_after_transport = expected_upper_base * (1 + transport_adjustment_pct)
     
-    # Step 7: Calculate extra adjustments (furnished, bathrooms, floor area, quality)
+    # Step 7: Calculate extra adjustments (furnished, bathrooms, floor area, quality, amenities)
     furnished_adj_base = get_furnished_adjustment(request.furnished)
     bathrooms_adj_base = get_bathrooms_adjustment(request.bathrooms, request.bedrooms)
     # Size adjustment: ONLY if area_used == True (B.4)
@@ -1512,8 +1560,16 @@ async def evaluate_property(request: EvaluateRequest):
     else:
         floor_area_adj_base = 0.0  # Must be 0 if area not used
     quality_adj_base = get_quality_adjustment(request.quality)
+    amenities_adj_base = get_amenities_adjustment(
+        request.has_lift,
+        request.has_parking,
+        request.has_balcony,
+        request.has_terrace,
+        request.has_concierge,
+        request.property_type
+    )
     
-    # Apply similarity dampening if strong_similarity is True
+    # Apply similarity dampening if strong_similarity is True (4)
     if strong_similarity:
         similarity_dampening_factor = 0.4
         # Dampen extra adjustments only (not transport)
@@ -1521,11 +1577,13 @@ async def evaluate_property(request: EvaluateRequest):
         bathrooms_adj = bathrooms_adj_base * similarity_dampening_factor
         floor_area_adj = floor_area_adj_base * similarity_dampening_factor
         quality_adj = quality_adj_base * similarity_dampening_factor
+        amenities_adj = amenities_adj_base * similarity_dampening_factor  # Dampen amenities too (4)
     else:
         furnished_adj = furnished_adj_base
         bathrooms_adj = bathrooms_adj_base
         floor_area_adj = floor_area_adj_base
         quality_adj = quality_adj_base
+        amenities_adj = amenities_adj_base
     
     # Step 7.5: Calculate photo condition adjustment (D, 6)
     photo_adjustment_pct = 0.0
@@ -1558,18 +1616,32 @@ async def evaluate_property(request: EvaluateRequest):
         photo_adjustment_pct = max(-0.10, min(max_adj, photo_adjustment_pct))
     
     # Combine extra adjustments and cap to [-0.12, +0.12]
-    extra_adjustment_pct = furnished_adj + bathrooms_adj + floor_area_adj + quality_adj
+    extra_adjustment_pct = furnished_adj + bathrooms_adj + floor_area_adj + quality_adj + amenities_adj
     extra_adjustment_pct = max(-0.12, min(0.12, extra_adjustment_pct))
     
-    # Build adjustments breakdown (B.4: size MUST be 0 if area not used)
+    # Build adjustments breakdown (B.4: size MUST be 0 if area not used) (5)
     adjustments_breakdown = {
         "transport": transport_adjustment_pct,
         "furnished": furnished_adj,
         "bathrooms": bathrooms_adj,
         "size": floor_area_adj if area_used else 0.0,  # Must be 0 if area not used
         "quality": quality_adj,
+        "amenities": amenities_adj,  # Add amenities to breakdown (5)
         "photo": photo_adjustment_pct
     }
+    
+    # Build list of amenities that are True for explanations (5)
+    amenities_list = []
+    if request.has_lift is True:
+        amenities_list.append("lift")
+    if request.has_parking is True:
+        amenities_list.append("parking")
+    if request.has_balcony is True and request.has_terrace is not True:
+        amenities_list.append("balcony")
+    if request.has_terrace is True:
+        amenities_list.append("terrace")
+    if request.has_concierge is True:
+        amenities_list.append("concierge")
     
     # Apply extra adjustment + photo adjustment
     total_extra_adj = extra_adjustment_pct + photo_adjustment_pct
@@ -1667,7 +1739,7 @@ async def evaluate_property(request: EvaluateRequest):
         else:
             explanations.append(f"Adjusted slightly for transport distance ({nearest_station_distance_m:.0f}m to nearest station)")
     
-    # User-facing explanations (B.10 - less technical, simplified)
+    # User-facing explanations (B.10 - less technical, simplified) (5)
     if extra_adjustment_pct != 0:
         adj_summary = []
         if adjustments_breakdown["furnished"] != 0:
@@ -1678,6 +1750,9 @@ async def evaluate_property(request: EvaluateRequest):
             adj_summary.append("size")
         if adjustments_breakdown["quality"] != 0:
             adj_summary.append("property condition")
+        # Add amenities explanation if present (5)
+        if adjustments_breakdown.get("amenities", 0) != 0 and amenities_list:
+            explanations.append(f"Adjusted for amenities ({', '.join(amenities_list)})")
         if adj_summary:
             explanations.append(f"Adjusted for property features ({', '.join(adj_summary)})")
     
@@ -1825,7 +1900,9 @@ async def evaluate_property(request: EvaluateRequest):
             "comps_source": comps_source,  # Always set: "db" | "csv" | "none" (1)
             "comps_db_count_recent": comps_db_count_recent if 'comps_db_count_recent' in locals() else 0,
             "comps_top10_weight_share": float(comps_top10_weight_share),  # (5)
-            "comps_weighted_quantiles_used": comps_weighted_quantiles_used  # (5)
+            "comps_weighted_quantiles_used": comps_weighted_quantiles_used,  # (5)
+            "amenities_used": amenities_list if 'amenities_list' in locals() else [],  # List of amenities that are True (6)
+            "amenities_adjustment_pct": float(amenities_adj) if 'amenities_adj' in locals() else 0.0  # Numeric adjustment (6)
         },
         location_source=location_source_debug,  # Never null, defaults to "none" (3)
         location_precision_m=float(location_precision_m_debug),  # Never null, defaults to 0.0 (3)
@@ -3068,8 +3145,29 @@ def extract_feature_booleans(html: str, soup: Any) -> Dict[str, Tuple[Optional[b
     except Exception:
         pass
     
-    # Priority 3: Regex fallback (only if found in structured context)
-    # We skip regex for features to avoid false positives - only use structured sections
+    # Priority 3: Regex fallback on full HTML text (case-insensitive)
+    # Only set True when confident; otherwise keep None
+    try:
+        html_lower = html.lower()
+        for feature_name, keywords in feature_keywords.items():
+            if result[feature_name][0] is None:  # Only if not already found
+                # Check for keywords in HTML text
+                for kw in keywords:
+                    # For multi-word phrases, use simple substring search
+                    # For single words, use word boundaries to avoid partial matches
+                    if ' ' in kw or '-' in kw:
+                        # Multi-word phrase: simple case-insensitive search
+                        if kw.lower() in html_lower:
+                            result[feature_name] = (True, 'regex')
+                            break
+                    else:
+                        # Single word: use word boundaries
+                        pattern = r'\b' + re.escape(kw) + r'\b'
+                        if re.search(pattern, html_lower, re.IGNORECASE):
+                            result[feature_name] = (True, 'regex')
+                            break  # Found one keyword, move to next feature
+    except Exception:
+        pass
     
     return result
 

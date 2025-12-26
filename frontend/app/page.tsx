@@ -94,6 +94,12 @@ interface EvaluateRequest {
   furnished?: boolean | null
   quality?: string
   save_as_comparable?: boolean
+  // Amenities (8)
+  has_lift?: boolean | null
+  has_parking?: boolean | null
+  has_balcony?: boolean | null
+  has_terrace?: boolean | null
+  has_concierge?: boolean | null
 }
 
 interface DebugInfo {
@@ -402,6 +408,12 @@ export default function Home() {
           photo_condition_confidence: assetAnalysis?.condition.confidence || null,
           floorplan_area_sqm: floorplanAreaSqm || null,
           floorplan_confidence: floorplanConfidence || null,
+          // Include amenities from parse result (8)
+          has_lift: parseResult?.has_lift ?? null,
+          has_parking: parseResult?.has_parking ?? null,
+          has_balcony: parseResult?.has_balcony ?? null,
+          has_terrace: parseResult?.has_terrace ?? null,
+          has_concierge: parseResult?.has_concierge ?? null,
         }),
       })
 
@@ -867,17 +879,82 @@ export default function Home() {
                   </Field>
                 </div>
                 
-                {/* Parsed features (read-only) */}
-                {(parseResult?.floor_level !== null && parseResult?.floor_level !== undefined) ||
-                 parseResult?.epc_rating ||
-                 parseResult?.has_lift !== null ||
-                 parseResult?.has_parking !== null ||
-                 parseResult?.has_balcony !== null ||
-                 parseResult?.has_terrace !== null ||
-                 parseResult?.has_concierge !== null ? (
-                  <div className="mt-4 pt-4 border-t border-stone-200">
-                    <div className="text-xs font-medium text-stone-700 mb-3">Parsed features</div>
-                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {/* Parsed features (read-only) - Always show amenities (7) */}
+                <div className="mt-4 pt-4 border-t border-stone-200">
+                  <div className="text-xs font-medium text-stone-700 mb-3">Parsed features</div>
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    {/* Always show amenities section (7) */}
+                    <div className="col-span-full">
+                      <div className="text-xs font-medium text-stone-600 mb-2">Amenities</div>
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-5">
+                          <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                            <span className="text-xs text-stone-600">Lift</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-medium text-stone-900">
+                                {parseResult?.has_lift !== null && parseResult?.has_lift !== undefined
+                                  ? (parseResult.has_lift ? 'Yes' : 'No')
+                                  : 'Not available'}
+                              </span>
+                              {parseResult?.has_lift !== null && parseResult?.has_lift !== undefined && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                            <span className="text-xs text-stone-600">Parking</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-medium text-stone-900">
+                                {parseResult?.has_parking !== null && parseResult?.has_parking !== undefined
+                                  ? (parseResult.has_parking ? 'Yes' : 'No')
+                                  : 'Not available'}
+                              </span>
+                              {parseResult?.has_parking !== null && parseResult?.has_parking !== undefined && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                            <span className="text-xs text-stone-600">Balcony</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-medium text-stone-900">
+                                {parseResult?.has_balcony !== null && parseResult?.has_balcony !== undefined
+                                  ? (parseResult.has_balcony ? 'Yes' : 'No')
+                                  : 'Not available'}
+                              </span>
+                              {parseResult?.has_balcony !== null && parseResult?.has_balcony !== undefined && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                            <span className="text-xs text-stone-600">Terrace</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-medium text-stone-900">
+                                {parseResult?.has_terrace !== null && parseResult?.has_terrace !== undefined
+                                  ? (parseResult.has_terrace ? 'Yes' : 'No')
+                                  : 'Not available'}
+                              </span>
+                              {parseResult?.has_terrace !== null && parseResult?.has_terrace !== undefined && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                            <span className="text-xs text-stone-600">Concierge</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-medium text-stone-900">
+                                {parseResult?.has_concierge !== null && parseResult?.has_concierge !== undefined
+                                  ? (parseResult.has_concierge ? 'Yes' : 'No')
+                                  : 'Not available'}
+                              </span>
+                              {parseResult?.has_concierge !== null && parseResult?.has_concierge !== undefined && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                      {/* Other parsed features (floor level, EPC) */}
                       {parseResult?.floor_level !== null && parseResult?.floor_level !== undefined && (
                         <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
                           <span className="text-xs text-stone-600">Floor level</span>
@@ -894,51 +971,6 @@ export default function Home() {
                           <span className="text-xs text-stone-600">EPC rating</span>
                           <div className="flex items-center gap-2">
                             <span className="text-sm font-medium text-stone-900">{parseResult?.epc_rating}</span>
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
-                          </div>
-                        </div>
-                      )}
-                      {parseResult?.has_lift !== null && parseResult?.has_lift !== undefined && (
-                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
-                          <span className="text-xs text-stone-600">Lift</span>
-                          <div className="flex items-center gap-2">
-                            <span className="text-sm font-medium text-stone-900">{parseResult?.has_lift ? 'Yes' : 'No'}</span>
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
-                          </div>
-                        </div>
-                      )}
-                      {parseResult?.has_parking !== null && parseResult?.has_parking !== undefined && (
-                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
-                          <span className="text-xs text-stone-600">Parking</span>
-                          <div className="flex items-center gap-2">
-                            <span className="text-sm font-medium text-stone-900">{parseResult?.has_parking ? 'Yes' : 'No'}</span>
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
-                          </div>
-                        </div>
-                      )}
-                      {parseResult?.has_balcony !== null && parseResult?.has_balcony !== undefined && (
-                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
-                          <span className="text-xs text-stone-600">Balcony</span>
-                          <div className="flex items-center gap-2">
-                            <span className="text-sm font-medium text-stone-900">{parseResult?.has_balcony ? 'Yes' : 'No'}</span>
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
-                          </div>
-                        </div>
-                      )}
-                      {parseResult?.has_terrace !== null && parseResult?.has_terrace !== undefined && (
-                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
-                          <span className="text-xs text-stone-600">Terrace</span>
-                          <div className="flex items-center gap-2">
-                            <span className="text-sm font-medium text-stone-900">{parseResult?.has_terrace ? 'Yes' : 'No'}</span>
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
-                          </div>
-                        </div>
-                      )}
-                      {parseResult?.has_concierge !== null && parseResult?.has_concierge !== undefined && (
-                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
-                          <span className="text-xs text-stone-600">Concierge</span>
-                          <div className="flex items-center gap-2">
-                            <span className="text-sm font-medium text-stone-900">{parseResult?.has_concierge ? 'Yes' : 'No'}</span>
                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
                           </div>
                         </div>
