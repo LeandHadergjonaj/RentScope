@@ -3,7 +3,6 @@
 import { useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { ChevronDown, ChevronRight, Info } from 'lucide-react'
-import GlassCard from './GlassCard'
 
 interface EvaluateResponse {
   comps_used: boolean
@@ -37,7 +36,7 @@ export default function WhyThisResult({ result }: WhyThisResultProps) {
   
   // Comparable listings info
   if (result.comps_used) {
-    keyPoints.push(`Comparable listings used: ${result.comps_sample_size} properties within ${result.comps_radius_m.toFixed(0)}m`)
+    keyPoints.push(`Comparable listings used: ${result.comps_sample_size} properties within ${Number(result.comps_radius_m ?? 0).toFixed(0)}m`)
   } else {
     keyPoints.push('Comparable listings: Not available or insufficient sample size')
   }
@@ -55,10 +54,10 @@ export default function WhyThisResult({ result }: WhyThisResultProps) {
   // Major adjustments
   const majorAdjustments: string[] = []
   if (result.transport_adjustment_pct !== 0) {
-    majorAdjustments.push(`Transport: ${result.transport_adjustment_pct > 0 ? '+' : ''}${(result.transport_adjustment_pct * 100).toFixed(1)}%`)
+    majorAdjustments.push(`Transport: ${result.transport_adjustment_pct > 0 ? '+' : ''}${Number((result.transport_adjustment_pct ?? 0) * 100).toFixed(1)}%`)
   }
   if (result.extra_adjustment_pct !== 0) {
-    majorAdjustments.push(`Features: ${result.extra_adjustment_pct > 0 ? '+' : ''}${(result.extra_adjustment_pct * 100).toFixed(1)}%`)
+    majorAdjustments.push(`Features: ${result.extra_adjustment_pct > 0 ? '+' : ''}${Number((result.extra_adjustment_pct ?? 0) * 100).toFixed(1)}%`)
   }
   if (majorAdjustments.length > 0) {
     keyPoints.push(`Major adjustments: ${majorAdjustments.join(', ')}`)
@@ -74,22 +73,18 @@ export default function WhyThisResult({ result }: WhyThisResultProps) {
   }
 
   return (
-    <GlassCard className="mt-6">
+    <div className="rounded-lg border border-stone-200 bg-white overflow-hidden shadow-sm">
       <button
         onClick={() => setIsExpanded(!isExpanded)}
-        className="w-full px-6 py-4 flex items-center justify-between text-left hover:bg-white/50 transition-colors rounded-t-2xl"
+        className="w-full px-4 py-3 flex items-center justify-between text-left hover:bg-stone-50 transition-colors"
         aria-expanded={isExpanded}
         aria-label="Toggle why this result explanation"
       >
-        <div className="flex items-center gap-3">
-          <Info className="w-5 h-5 text-blue-600" />
-          <span className="font-semibold text-gray-900">Why this result?</span>
+        <div className="flex items-center gap-2">
+          <Info className="w-4 h-4 text-emerald-700" />
+          <span className="font-medium text-stone-900">Why this result?</span>
         </div>
-        {isExpanded ? (
-          <ChevronDown className="w-5 h-5 text-gray-500" />
-        ) : (
-          <ChevronRight className="w-5 h-5 text-gray-500" />
-        )}
+        <ChevronDown className={`w-4 h-4 text-stone-400 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
       </button>
 
       <AnimatePresence>
@@ -101,32 +96,32 @@ export default function WhyThisResult({ result }: WhyThisResultProps) {
             transition={{ duration: 0.3 }}
             className="overflow-hidden"
           >
-            <div className="px-6 pb-6 pt-2 border-t border-gray-200">
-              <ul className="space-y-3">
+            <div className="px-4 pb-4 pt-2 border-t border-stone-200">
+              <ul className="space-y-2 text-sm text-stone-700">
                 {keyPoints.map((point, index) => (
                   <motion.li
                     key={index}
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     transition={{ delay: index * 0.05 }}
-                    className="text-sm text-gray-700 flex items-start gap-2"
+                    className="flex items-start gap-2"
                   >
-                    <span className="text-blue-600 mt-1">•</span>
+                    <span className="text-emerald-700 mt-0.5">•</span>
                     <span>{point}</span>
                   </motion.li>
                 ))}
               </ul>
-              <div className="mt-6 pt-6 border-t border-gray-200">
-                <p className="text-xs font-semibold text-gray-600 mb-3">Full Details</p>
-                <ul className="space-y-2">
+              <div className="mt-4 pt-4 border-t border-stone-200">
+                <p className="text-xs font-semibold text-stone-600 mb-2">Full Details</p>
+                <ul className="space-y-1.5">
                   {result.explanations.map((explanation, index) => (
-                    <li key={index} className="text-xs text-gray-600 flex items-start gap-2">
-                      <span className="text-gray-400 mt-1">•</span>
+                    <li key={index} className="text-xs text-stone-600 flex items-start gap-2">
+                      <span className="text-stone-400 mt-0.5">•</span>
                       <span>{explanation}</span>
                     </li>
                   ))}
                   {result.most_likely_range_pcm && (
-                    <li className="text-xs text-gray-600 mt-3 pt-3 border-t border-gray-300">
+                    <li className="text-xs text-stone-600 mt-2 pt-2 border-t border-stone-200">
                       <strong>Statistical range:</strong> £{result.expected_range_pcm[0].toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 })} - £{result.expected_range_pcm[1].toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}/month
                     </li>
                   )}
@@ -136,7 +131,7 @@ export default function WhyThisResult({ result }: WhyThisResultProps) {
           </motion.div>
         )}
       </AnimatePresence>
-    </GlassCard>
+    </div>
   )
 }
 

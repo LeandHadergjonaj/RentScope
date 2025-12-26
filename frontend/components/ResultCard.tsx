@@ -133,13 +133,13 @@ export default function ResultCard({ result, formatPrice, getDeviationLanguage }
           {result.nearest_station_distance_m > 0 && (
             <div className="bg-gray-50 rounded-xl p-4 border border-gray-100">
               <p className="text-xs font-medium text-gray-500 mb-1">Nearest Station</p>
-              <p className="text-lg font-bold text-gray-900">{result.nearest_station_distance_m.toFixed(0)}m</p>
+              <p className="text-lg font-bold text-gray-900">{Number(result.nearest_station_distance_m ?? 0).toFixed(0)}m</p>
             </div>
           )}
           <div className="bg-gray-50 rounded-xl p-4 border border-gray-100">
             <p className="text-xs font-medium text-gray-500 mb-1">Comparables</p>
             <p className="text-lg font-bold text-gray-900">
-              {result.comps_used ? `${result.comps_sample_size} within ${result.comps_radius_m.toFixed(0)}m` : 'None'}
+              {result.comps_used ? `${result.comps_sample_size} within ${Number(result.comps_radius_m ?? 0).toFixed(0)}m` : 'None'}
             </p>
           </div>
         </div>
@@ -150,7 +150,7 @@ export default function ResultCard({ result, formatPrice, getDeviationLanguage }
             <p className="text-sm font-semibold text-blue-900 mb-2">Comparable Analysis</p>
             <div className="space-y-1 text-sm text-blue-800">
               <p>Sample size: <span className="font-semibold">{result.comps_sample_size}</span> properties</p>
-              <p>Search radius: <span className="font-semibold">{result.comps_radius_m.toFixed(0)}m</span></p>
+              <p>Search radius: <span className="font-semibold">{Number(result.comps_radius_m ?? 0).toFixed(0)}m</span></p>
               <p className="text-xs text-blue-700 mt-2 pt-2 border-t border-blue-300">
                 Comparable estimate: £{result.comps_expected_median_pcm.toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}/month
               </p>

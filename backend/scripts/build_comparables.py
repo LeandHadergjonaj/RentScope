@@ -12,6 +12,14 @@ import re
 import math
 import numpy as np
 
+# Try to import scipy for KDTree (optional)
+try:
+    from scipy.spatial import cKDTree
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    cKDTree = None
+
 def normalize_property_type(prop_type: str) -> str:
     """Normalize property type to flat|house|studio|room"""
     if pd.isna(prop_type):
@@ -138,6 +146,95 @@ def extract_district_from_address(address: str) -> str:
     
     return ""
 
+def normalize_postcode(postcode: str) -> str:
+    """Normalize postcode to standard format: uppercase, single space before last 3 chars"""
+    if not postcode or pd.isna(postcode):
+        return ""
+    # Remove all spaces and convert to uppercase
+    clean = str(postcode).replace(" ", "").upper()
+    if len(clean) >= 5:
+        # Insert space before last 3 characters
+        return clean[:-3] + " " + clean[-3:]
+    return clean
+
+def build_postcode_kdtree(postcode_df: pd.DataFrame):
+    """
+    Build KDTree for fast nearest postcode lookup.
+    Returns (kdtree, coords, lookup_data) or (None, None, None) if unavailable.
+    """
+    try:
+        # Filter to rows with valid lat/lon
+        valid_mask = postcode_df['lat'].notna() & postcode_df['lon'].notna()
+        valid_df = postcode_df[valid_mask].copy()
+        
+        if len(valid_df) == 0:
+            return None, None, None
+        
+        # Extract coordinates as numpy array
+        coords = valid_df[['lat', 'lon']].values.astype(np.float64)
+        
+        # Build KDTree if scipy available, otherwise return data for vectorized search
+        kdtree = None
+        if SCIPY_AVAILABLE and cKDTree is not None:
+            kdtree = cKDTree(coords)
+        
+        # Store lookup data (postcode, ladcd, lat, lon)
+        lookup_data = valid_df[['postcode', 'ladcd', 'lat', 'lon']].copy()
+        
+        return kdtree, coords, lookup_data
+    except Exception as e:
+        print(f"Warning: Could not build postcode KDTree: {e}")
+        return None, None, None
+
+def infer_postcode_from_latlon(lat: float, lon: float, kdtree, coords, lookup_data):
+    """
+    Infer nearest postcode from lat/lon coordinates using pre-built KDTree.
+    Returns dict with {postcode, ladcd, dist_m} or None if lookup unavailable.
+    Uses Haversine distance for accurate meter calculation.
+    """
+    if kdtree is None or coords is None or lookup_data is None:
+        return None
+    
+    if pd.isna(lat) or pd.isna(lon):
+        return None
+    
+    try:
+        query_point = np.array([[lat, lon]], dtype=np.float64)
+        
+        if SCIPY_AVAILABLE and kdtree is not None:
+            # Use KDTree for fast lookup (returns distance in degrees)
+            dist_deg, idx = kdtree.query(query_point, k=1)
+            nearest_idx = int(idx[0])
+        else:
+            # Vectorized nearest search (fallback, returns distance in degrees)
+            distances = np.sqrt(
+                np.sum((coords - query_point) ** 2, axis=1)
+            )
+            nearest_idx = int(np.argmin(distances))
+            dist_deg = distances[nearest_idx]
+        
+        # Get postcode and ladcd from lookup data
+        nearest_row = lookup_data.iloc[nearest_idx]
+        nearest_lat = float(nearest_row['lat'])
+        nearest_lon = float(nearest_row['lon'])
+        
+        # Calculate accurate distance using Haversine
+        dist_m = haversine_distance(lat, lon, nearest_lat, nearest_lon)
+        
+        postcode = str(nearest_row['postcode']).strip() if pd.notna(nearest_row['postcode']) else None
+        ladcd = str(nearest_row['ladcd']).strip() if pd.notna(nearest_row['ladcd']) else None
+        
+        if postcode:
+            postcode = normalize_postcode(postcode)
+        
+        return {
+            'postcode': postcode,
+            'ladcd': ladcd,
+            'dist_m': dist_m
+        }
+    except Exception as e:
+        return None
+
 def main():
     # Get paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -255,10 +352,64 @@ def main():
         on="district",
         how="left"
     )
-    df["postcode"] = df["rep_postcode"]
+    # Normalize postcodes from district centroids
+    df["postcode"] = df["rep_postcode"].apply(lambda x: normalize_postcode(str(x)) if pd.notna(x) else None)
     df["postcode_district"] = df["district"]
     df["location_precision"] = "district_centroid"
     df = df.drop(columns=["rep_postcode"])  # Clean up
+    
+    # Initialize metadata columns for all rows
+    df["postcode_source"] = "district_centroid"
+    df["postcode_inferred_dist_m"] = None
+    
+    # NEW: Infer postcodes for rows with lat/lon but missing postcode
+    print("\nInferring postcodes for rows with lat/lon but missing postcode...")
+    
+    # Build KDTree for fast postcode lookup
+    postcode_kdtree, postcode_coords, postcode_lookup_data = build_postcode_kdtree(postcode_lookup)
+    
+    if postcode_kdtree is not None or postcode_coords is not None:
+        # Find rows with lat/lon but missing postcode
+        missing_postcode_mask = (
+            df["lat"].notna() & 
+            df["lon"].notna() & 
+            (df["postcode"].isna() | (df["postcode"] == ""))
+        )
+        rows_to_infer = missing_postcode_mask.sum()
+        
+        if rows_to_infer > 0:
+            print(f"Found {rows_to_infer} rows with lat/lon but missing postcode")
+            
+            # Infer postcodes for rows missing them
+            def infer_postcode_row(row):
+                if pd.isna(row["lat"]) or pd.isna(row["lon"]):
+                    return row
+                
+                result = infer_postcode_from_latlon(
+                    row["lat"], 
+                    row["lon"],
+                    postcode_kdtree,
+                    postcode_coords,
+                    postcode_lookup_data
+                )
+                
+                if result and result.get("postcode") and result.get("dist_m", float('inf')) <= 500:
+                    row["postcode"] = result["postcode"]
+                    row["postcode_source"] = "inferred"
+                    row["postcode_inferred_dist_m"] = result["dist_m"]
+                # If dist_m > 500 or inference failed, leave postcode as None (will be excluded later)
+                
+                return row
+            
+            # Apply inference (vectorized where possible, but need row-by-row for conditional logic)
+            df.loc[missing_postcode_mask] = df.loc[missing_postcode_mask].apply(infer_postcode_row, axis=1)
+            
+            inferred_count = (df["postcode_source"] == "inferred").sum()
+            print(f"Inferred postcodes for {inferred_count} rows (dist <= 500m)")
+        else:
+            print("No rows found with lat/lon but missing postcode")
+    else:
+        print("Warning: Could not build postcode KDTree, skipping postcode inference")
     
     # Set dates (today-30d and today)
     today = datetime.now()
@@ -284,9 +435,14 @@ def main():
     df = df[bedrooms_valid].copy()
     print(f"After bedroom filter (0 <= bedrooms <= 10): {len(df)} rows (dropped {initial_count - len(df)})")
     
+    # Drop rows where postcode is still missing (after inference attempt)
+    initial_count = len(df)
+    df = df[df["postcode"].notna() & (df["postcode"] != "")].copy()
+    print(f"After postcode filter (postcode required): {len(df)} rows (dropped {initial_count - len(df)})")
+    
     # Ensure required columns exist
     required_cols = ["price_pcm", "bedrooms", "bathrooms", "property_type", "lat", "lon", "first_seen", "last_seen", "postcode", "postcode_district", "location_precision"]
-    optional_cols = ["furnished", "floor_area_sqm"]
+    optional_cols = ["furnished", "floor_area_sqm", "postcode_source", "postcode_inferred_dist_m"]
     
     # Select and order columns
     output_cols = required_cols + [col for col in optional_cols if col in df.columns]

@@ -59,6 +59,22 @@ interface ParseListingResponse {
   inferred_postcode_distance_m?: number | null
   address_text?: string | null
   location_precision_m?: number | null
+  // Additional structured features (V23)
+  floor_level?: number | null
+  epc_rating?: string | null
+  has_lift?: boolean | null
+  has_parking?: boolean | null
+  has_balcony?: boolean | null
+  has_terrace?: boolean | null
+  has_concierge?: boolean | null
+  parsed_feature_warnings?: string[]
+  // Debug output (only when debug=true)
+  debug_raw?: {
+    url?: string
+    candidates?: Record<string, any>
+    chosen?: Record<string, any>
+    snippets?: Record<string, string>
+  } | null
 }
 
 interface EvaluateRequest {
@@ -71,6 +87,7 @@ interface EvaluateRequest {
   floor_area_sqm?: number | null
   furnished?: boolean | null
   quality?: string
+  save_as_comparable?: boolean
 }
 
 interface DebugInfo {
@@ -156,6 +173,7 @@ export default function Home() {
     quality: 'average',
     lat: null,
     lon: null,
+    save_as_comparable: true,  // Default true
   })
   const [result, setResult] = useState<EvaluateResponse | null>(null)
   const [loading, setLoading] = useState(false)
@@ -166,6 +184,7 @@ export default function Home() {
   const [autoFilledFields, setAutoFilledFields] = useState<Set<string>>(new Set())
   const [parseConfidenceLow, setParseConfidenceLow] = useState(false)
   const [parsingConfidence, setParsingConfidence] = useState<'high' | 'medium' | 'low' | null>(null)
+  const [fullParseResult, setFullParseResult] = useState<ParseListingResponse | null>(null) // Store full parse result for debug
   const [analyzingAssets, setAnalyzingAssets] = useState(false)
   const [assetAnalysis, setAssetAnalysis] = useState<{
     condition: { label: string; score: number; confidence: string; signals: string[] }
@@ -176,6 +195,8 @@ export default function Home() {
   // Store floorplan data separately for /evaluate request (1, 2)
   const [floorplanAreaSqm, setFloorplanAreaSqm] = useState<number | null>(null)
   const [floorplanConfidence, setFloorplanConfidence] = useState<string | null>(null)
+  const [developerMode, setDeveloperMode] = useState(false) // A.6 - Developer mode toggle
+  const [debugParse, setDebugParse] = useState(false) // Debug parse toggle
   const priceInputRef = useRef<HTMLInputElement>(null)
 
   // Analyze listing assets from URL
@@ -240,7 +261,11 @@ export default function Home() {
     setParsingConfidence(null)
 
     try {
-      const response = await fetch('/api/parse-listing', {
+      const url = debugParse 
+        ? `/api/parse-listing?debug=true`
+        : '/api/parse-listing'
+      
+      const response = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -253,6 +278,9 @@ export default function Home() {
       }
 
       const data: ParseListingResponse = await response.json()
+      
+      // Store full parse result for debug
+      setFullParseResult(data)
       
       // Update parsing confidence
       setParsingConfidence(data.parsing_confidence)
@@ -361,6 +389,7 @@ export default function Home() {
           quality: formData.quality || 'average',
           lat: formData.lat || null,
           lon: formData.lon || null,
+          save_as_comparable: formData.save_as_comparable ?? true,  // Default true
           // Include asset analysis results if available (2)
           photo_condition_label: assetAnalysis?.condition.label || null,
           photo_condition_score: assetAnalysis?.condition.score || null,
@@ -471,50 +500,72 @@ export default function Home() {
     }
   }
 
-  // Construct parseResult from existing state
-  const parseResult = parsingConfidence ? {
+  // Construct parseResult from full parse result or existing state
+  const parseResult = fullParseResult || (parsingConfidence ? {
     parsing_confidence: parsingConfidence,
     extracted_fields: Array.from(autoFilledFields),
     warnings: parseWarnings
-  } : null
+  } : null)
+
+  // Get simplified explanations (max 3, non-technical) (A.2, C.11)
+  const getSimplifiedExplanations = (explanations: string[]): string[] => {
+    const nonTechnical = explanations.filter(e => 
+      !e.includes('ONS') && 
+      !e.includes('KDTree') && 
+      !e.includes('MAE') &&
+      !e.includes('blended estimate') &&
+      !e.includes('time-on-market weighted') &&
+      !e.includes('Final expected median')
+    )
+    return nonTechnical.slice(0, 3)
+  }
+
+  // Get confidence explanation (A.2)
+  const getConfidenceExplanation = (result: EvaluateResponse): string => {
+    if (result.comps_used && result.comps_sample_size > 0) {
+      return `We found ${result.comps_sample_size} nearby rentals`
+    }
+    return `Based on borough market data`
+  }
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100">
-      {/* Background glow */}
-      <div className="pointer-events-none fixed inset-0 overflow-hidden">
-        <div className="absolute -top-40 left-1/2 h-[520px] w-[900px] -translate-x-1/2 rounded-full bg-gradient-to-r from-indigo-500/20 via-fuchsia-500/10 to-cyan-500/20 blur-3xl" />
-        <div className="absolute bottom-[-220px] right-[-220px] h-[520px] w-[520px] rounded-full bg-emerald-500/10 blur-3xl" />
-        <div className="absolute top-[40%] left-[-240px] h-[420px] w-[420px] rounded-full bg-amber-500/10 blur-3xl" />
-      </div>
-
-      <div className="relative mx-auto max-w-6xl px-6 py-10">
+    <div className="min-h-screen bg-stone-50 text-stone-900">
+      <div className="mx-auto max-w-6xl px-6 py-10">
         {/* Header */}
         <div className="mb-8 flex flex-col gap-3">
-          <div className="inline-flex w-fit items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-200">
-            <ShieldCheck className="h-4 w-4 text-emerald-300" />
+          <div className="inline-flex w-fit items-center gap-2 rounded-full border border-stone-200 bg-white px-3 py-1 text-xs text-stone-600 shadow-sm">
+            <ShieldCheck className="h-4 w-4 text-emerald-700" />
             Market sanity-check • London rentals
           </div>
 
           <div className="flex items-end justify-between gap-4">
             <div>
-              <h1 className="text-4xl font-semibold tracking-tight">
-                Rent<span className="text-white/80">Scope</span>
+              <h1 className="text-4xl font-semibold tracking-tight text-stone-900">
+                Rent<span className="text-stone-600">Scope</span>
               </h1>
-              <p className="mt-2 max-w-2xl text-sm text-zinc-300">
-                Paste a listing link and get a tighter, explainable estimate using comparables, borough baselines, and optional AI signals.
+              <p className="mt-2 max-w-2xl text-sm text-stone-600">
+                Get a fair rent estimate for any London property. Paste a listing link or enter details manually.
               </p>
             </div>
 
-            <div className="hidden md:flex items-center gap-2 text-xs text-zinc-400">
-              <Sparkles className="h-4 w-4" />
-              Rich UI mode
+            {/* Developer mode toggle (A.6) */}
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-2 text-xs text-stone-600 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={developerMode}
+                  onChange={(e) => setDeveloperMode(e.target.checked)}
+                  className="rounded border-stone-300 text-emerald-700 focus:ring-emerald-500"
+                />
+                <span>Developer mode</span>
+              </label>
             </div>
           </div>
         </div>
 
         {/* Error banner */}
         {error && (
-          <div className="mb-6 rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+          <div className="mb-6 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
             <p className="font-medium">Error</p>
             <p>{error}</p>
           </div>
@@ -526,8 +577,8 @@ export default function Home() {
           <GlassCard>
             <SectionTitle icon={<Search className="h-4 w-4" />} title="Listing" subtitle="Extract details from Rightmove/Zoopla (best effort). Review before evaluating." />
 
-            <div className="mt-4 space-y-3">
-              <label className="text-xs text-zinc-300">Listing link (optional)</label>
+              <div className="mt-4 space-y-3">
+              <label className="text-xs text-stone-600 font-medium">Listing link (optional)</label>
               <input
                 type="url"
                 value={listingUrl}
@@ -541,7 +592,7 @@ export default function Home() {
                   type="button"
                   onClick={handleParseListing}
                   disabled={parsing || !listingUrl.trim()}
-                  className="inline-flex items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/10 px-4 py-3 text-sm font-medium text-zinc-100 hover:bg-white/15 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  className="inline-flex items-center justify-center gap-2 rounded-lg border border-stone-200 bg-stone-100 px-4 py-3 text-sm font-medium text-stone-800 hover:bg-stone-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
                   <Search className="h-4 w-4" />
                   {parsing ? "Extracting..." : "Extract details"}
@@ -551,7 +602,7 @@ export default function Home() {
                   type="button"
                   onClick={handleAnalyzeAssets}
                   disabled={analyzingAssets || !listingUrl.trim()}
-                  className="inline-flex items-center justify-center gap-2 rounded-xl border border-indigo-400/20 bg-indigo-500/15 px-4 py-3 text-sm font-medium text-indigo-100 hover:bg-indigo-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  className="inline-flex items-center justify-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-800 hover:bg-emerald-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
                   <Sparkles className="h-4 w-4" />
                   {analyzingAssets ? "Analyzing..." : "Analyze photos + floorplan"}
@@ -575,11 +626,41 @@ export default function Home() {
                   </div>
                 )}
               </div>
+              
+              {/* Parse Debug Panel (only when debug_raw is present) */}
+              {fullParseResult?.debug_raw && (
+                <Accordion title="Parse Debug">
+                  <div className="space-y-3 text-xs">
+                    <div>
+                      <div className="font-semibold text-stone-900 mb-1">Extracted Fields</div>
+                      <div className="text-stone-700 font-mono">
+                        {fullParseResult.extracted_fields?.join(', ') || 'None'}
+                      </div>
+                    </div>
+                    {fullParseResult.warnings && fullParseResult.warnings.length > 0 && (
+                      <div>
+                        <div className="font-semibold text-stone-900 mb-1">Warnings</div>
+                        <ul className="list-disc list-inside text-stone-700 space-y-1">
+                          {fullParseResult.warnings.map((w, i) => (
+                            <li key={i}>{w}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    <div>
+                      <div className="font-semibold text-stone-900 mb-1">Debug Raw (JSON)</div>
+                      <pre className="bg-stone-50 border border-stone-200 rounded-lg p-3 text-[10px] overflow-x-auto max-h-96 overflow-y-auto">
+                        {JSON.stringify(fullParseResult.debug_raw, null, 2)}
+                      </pre>
+                    </div>
+                  </div>
+                </Accordion>
+              )}
 
               {assetAnalysis && (
-                <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4">
+                <div className="mt-4 rounded-lg border border-stone-200 bg-white p-4 shadow-sm">
                   <div className="flex items-center justify-between">
-                    <div className="text-sm font-medium text-zinc-100">Listing Analysis Results</div>
+                    <div className="text-sm font-medium text-stone-900">Listing Analysis Results</div>
                     <StatBadge
                       label={`Assets: ${assetAnalysis?.assets_used?.photos_used ?? 0} photos`}
                       tone={(assetAnalysis?.assets_used?.photos_used ?? 0) >= 2 ? "good" : "warn"}
@@ -587,36 +668,36 @@ export default function Home() {
                   </div>
 
                   <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    <div className="rounded-xl border border-white/10 bg-zinc-950/30 p-3">
-                      <div className="text-xs text-zinc-400">Condition</div>
-                      <div className="mt-1 text-sm text-zinc-100">
+                    <div className="rounded-lg border border-stone-200 bg-stone-50 p-3">
+                      <div className="text-xs text-stone-500">Condition</div>
+                      <div className="mt-1 text-sm text-stone-900">
                         {assetAnalysis?.condition?.label ?? "—"}{" "}
-                        <span className="text-zinc-400">
+                        <span className="text-stone-600">
                           ({assetAnalysis?.condition?.score ?? "—"}/100)
                         </span>
                       </div>
-                      <div className="mt-1 text-xs text-zinc-400">
+                      <div className="mt-1 text-xs text-stone-500">
                         Confidence: {assetAnalysis?.condition?.confidence ?? "—"}
                       </div>
                     </div>
 
-                    <div className="rounded-xl border border-white/10 bg-zinc-950/30 p-3">
-                      <div className="text-xs text-zinc-400">Floorplan</div>
-                      <div className="mt-1 text-sm text-zinc-100">
-                        Area: {assetAnalysis?.floorplan?.extracted?.estimated_area_sqm ? assetAnalysis.floorplan.extracted.estimated_area_sqm.toFixed(1) : "—"} m²
+                    <div className="rounded-lg border border-stone-200 bg-stone-50 p-3">
+                      <div className="text-xs text-stone-500">Floorplan</div>
+                      <div className="mt-1 text-sm text-stone-900">
+                        Area: {assetAnalysis?.floorplan?.extracted?.estimated_area_sqm ? Number(assetAnalysis.floorplan.extracted.estimated_area_sqm ?? 0).toFixed(1) : "—"} m²
                       </div>
-                      <div className="mt-1 text-xs text-zinc-400">
+                      <div className="mt-1 text-xs text-stone-500">
                         Confidence: {assetAnalysis?.floorplan?.confidence ?? "—"}
                       </div>
                     </div>
                   </div>
 
                   {assetAnalysis?.condition?.signals?.length ? (
-                    <div className="mt-3 text-xs text-zinc-300">
-                      <div className="text-zinc-400">Signals</div>
+                    <div className="mt-3 text-xs text-stone-600">
+                      <div className="text-stone-500 mb-1">Signals</div>
                       <div className="mt-1 flex flex-wrap gap-2">
                         {assetAnalysis.condition.signals.slice(0, 6).map((s: string, i: number) => (
-                          <span key={i} className="rounded-full border border-white/10 bg-white/5 px-2 py-1">
+                          <span key={i} className="rounded-full border border-stone-200 bg-stone-50 px-2 py-1 text-stone-700">
                             {s}
                           </span>
                         ))}
@@ -779,18 +860,103 @@ export default function Home() {
                     </select>
                   </Field>
                 </div>
+                
+                {/* Parsed features (read-only) */}
+                {(parseResult?.floor_level !== null && parseResult?.floor_level !== undefined) ||
+                 parseResult?.epc_rating ||
+                 parseResult?.has_lift !== null ||
+                 parseResult?.has_parking !== null ||
+                 parseResult?.has_balcony !== null ||
+                 parseResult?.has_terrace !== null ||
+                 parseResult?.has_concierge !== null ? (
+                  <div className="mt-4 pt-4 border-t border-stone-200">
+                    <div className="text-xs font-medium text-stone-700 mb-3">Parsed features</div>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      {parseResult?.floor_level !== null && parseResult?.floor_level !== undefined && (
+                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                          <span className="text-xs text-stone-600">Floor level</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium text-stone-900">
+                              {parseResult?.floor_level === 0 ? 'Ground' : parseResult?.floor_level === -1 ? 'Lower ground' : `${parseResult?.floor_level}${parseResult?.floor_level === 1 ? 'st' : parseResult?.floor_level === 2 ? 'nd' : parseResult?.floor_level === 3 ? 'rd' : 'th'}`}
+                            </span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                          </div>
+                        </div>
+                      )}
+                      {parseResult?.epc_rating && (
+                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                          <span className="text-xs text-stone-600">EPC rating</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium text-stone-900">{parseResult?.epc_rating}</span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                          </div>
+                        </div>
+                      )}
+                      {parseResult?.has_lift !== null && parseResult?.has_lift !== undefined && (
+                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                          <span className="text-xs text-stone-600">Lift</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium text-stone-900">{parseResult?.has_lift ? 'Yes' : 'No'}</span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                          </div>
+                        </div>
+                      )}
+                      {parseResult?.has_parking !== null && parseResult?.has_parking !== undefined && (
+                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                          <span className="text-xs text-stone-600">Parking</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium text-stone-900">{parseResult?.has_parking ? 'Yes' : 'No'}</span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                          </div>
+                        </div>
+                      )}
+                      {parseResult?.has_balcony !== null && parseResult?.has_balcony !== undefined && (
+                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                          <span className="text-xs text-stone-600">Balcony</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium text-stone-900">{parseResult?.has_balcony ? 'Yes' : 'No'}</span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                          </div>
+                        </div>
+                      )}
+                      {parseResult?.has_terrace !== null && parseResult?.has_terrace !== undefined && (
+                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                          <span className="text-xs text-stone-600">Terrace</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium text-stone-900">{parseResult?.has_terrace ? 'Yes' : 'No'}</span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                          </div>
+                        </div>
+                      )}
+                      {parseResult?.has_concierge !== null && parseResult?.has_concierge !== undefined && (
+                        <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                          <span className="text-xs text-stone-600">Concierge</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium text-stone-900">{parseResult?.has_concierge ? 'Yes' : 'No'}</span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Parsed</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    {parseResult?.parsing_confidence === 'low' && parseResult?.parsed_feature_warnings && parseResult.parsed_feature_warnings.length > 0 && (
+                      <div className="mt-3 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                        Some details were inferred — please review carefully
+                      </div>
+                    )}
+                  </div>
+                ) : null}
               </Accordion>
 
               <button
                 type="submit"
                 disabled={loading}
-                className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-indigo-500 to-fuchsia-500 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-fuchsia-500/10 hover:opacity-95 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
+                className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-700 px-4 py-3 text-sm font-semibold text-white shadow-sm hover:bg-emerald-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 {loading ? "Evaluating..." : "Evaluate property"}
                 <ArrowRight className="h-4 w-4" />
               </button>
 
-              <div className="mt-3 text-xs text-zinc-400">
+              <div className="mt-3 text-xs text-stone-500">
                 RentScope provides a market sanity check — not a guaranteed valuation.
               </div>
             </div>
@@ -803,59 +969,156 @@ export default function Home() {
               <SectionTitle icon={<Sparkles className="h-4 w-4" />} title="Evaluation results" subtitle="Premium, explainable output." />
 
               {!result ? (
-                <div className="mt-6 rounded-2xl border border-white/10 bg-white/5 p-6 text-sm text-zinc-300">
-                  Paste a link or fill the details, then hit <span className="font-semibold text-white">Evaluate property</span>.
-                  <div className="mt-3 grid grid-cols-2 gap-3 text-xs text-zinc-400">
-                    <div className="rounded-xl border border-white/10 bg-zinc-950/30 p-3">• Tight "Most-likely range" when evidence is strong</div>
-                    <div className="rounded-xl border border-white/10 bg-zinc-950/30 p-3">• Transparent comparables + ML + baseline blend</div>
-                  </div>
+                <div className="mt-6 rounded-xl border border-stone-200 bg-white p-6 text-sm text-stone-600 shadow-sm">
+                  Paste a link or fill the details, then hit <span className="font-semibold text-stone-900">Evaluate property</span>.
                 </div>
               ) : (
                 <div className="mt-6 space-y-4">
-                  <div className="flex flex-wrap items-center gap-2">
+                  {/* Verdict chip (A.2) */}
+                  <div className="flex items-center gap-3">
                     <StatBadge
-                      label={`Classification: ${result.classification}`}
+                      label={result.classification === "undervalued" ? "Good deal" : result.classification === "overvalued" ? "Overpriced" : "Fair price"}
                       tone={result.classification === "undervalued" ? "good" : result.classification === "overvalued" ? "bad" : "neutral"}
                     />
-                    <StatBadge label={`Confidence: ${result.confidence}`} tone={result.confidence === "high" ? "good" : result.confidence === "medium" ? "warn" : "bad"} />
                   </div>
 
-                  <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
-                    <div className="text-xs text-zinc-400">Expected median</div>
-                    <div className="mt-1 text-3xl font-semibold tracking-tight">£{Math.round(result.expected_median_pcm).toLocaleString()}/month</div>
+                  {/* Estimated fair price (A.2) */}
+                  <div className="rounded-xl border border-stone-200 bg-white p-6 shadow-sm">
+                    <div className="text-xs text-stone-500 font-medium mb-1">Estimated fair rent</div>
+                    <div className="mt-1 text-4xl font-bold tracking-tight text-stone-900">£{Math.round(result.expected_median_pcm).toLocaleString()}/month</div>
 
-                    {result.most_likely_range_pcm?.length === 2 && (
-                      <div className="mt-3 rounded-xl border border-white/10 bg-zinc-950/30 p-3">
-                        <div className="text-xs text-zinc-400">Most-likely range</div>
-                        <div className="mt-1 text-sm text-zinc-100">
+                    {/* Most-likely range (A.2, C.11) */}
+                    {result.most_likely_range_pcm?.length === 2 ? (
+                      <div className="mt-4 inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-4 py-2">
+                        <span className="text-sm font-semibold text-emerald-800">
                           £{Math.round(result.most_likely_range_pcm[0]).toLocaleString()} — £{Math.round(result.most_likely_range_pcm[1]).toLocaleString()}
-                        </div>
-                        <div className="mt-1 text-xs text-zinc-400">{result.most_likely_range_basis ?? ""}</div>
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="mt-4 inline-flex items-center gap-2 rounded-full border border-stone-200 bg-stone-50 px-4 py-2">
+                        <span className="text-sm font-semibold text-stone-700">
+                          £{Math.round(result.expected_range_pcm[0]).toLocaleString()} — £{Math.round(result.expected_range_pcm[1]).toLocaleString()}
+                        </span>
                       </div>
                     )}
-
-                    <div className="mt-4 grid grid-cols-2 gap-3 text-xs">
-                      <MiniStat icon={<MapPin className="h-4 w-4" />} label="Borough" value={result.borough ?? "—"} />
-                      <MiniStat icon={<Train className="h-4 w-4" />} label="Nearest station" value={result.nearest_station_distance_m ? `${Math.round(result.nearest_station_distance_m)}m` : "—"} />
-                      <MiniStat icon={<BarChart3 className="h-4 w-4" />} label="Listed price" value={`£${Math.round(result.listed_price_pcm).toLocaleString()}/mo`} />
-                      <MiniStat icon={<BarChart3 className="h-4 w-4" />} label="Deviation" value={`${Math.round((result.deviation_pct_damped ?? result.deviation_pct ?? 0) * 100)}%`} />
-                    </div>
                   </div>
 
-                  <Accordion title="Why this result?">
-                    <WhyThisResult result={result} />
+                  {/* Short explanation bullets (A.2, C.11) */}
+                  <div className="rounded-xl border border-stone-200 bg-white p-4 shadow-sm">
+                    <div className="text-xs text-stone-500 font-medium mb-2">Why?</div>
+                    <ul className="space-y-1.5 text-sm text-stone-700">
+                      {getSimplifiedExplanations(result.explanations).map((explanation, idx) => (
+                        <li key={idx} className="flex items-start gap-2">
+                          <span className="text-emerald-700 mt-1">•</span>
+                          <span>{explanation}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  {/* Confidence level (A.2) */}
+                  <div className="rounded-xl border border-stone-200 bg-white p-4 shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="text-xs text-stone-500 font-medium mb-1">Confidence level</div>
+                        <div className="text-sm font-semibold text-stone-900 capitalize">{result.confidence}</div>
+                      </div>
+                      <StatBadge 
+                        label={result.confidence.toUpperCase()} 
+                        tone={result.confidence === "high" ? "good" : result.confidence === "medium" ? "warn" : "bad"} 
+                      />
+                    </div>
+                    <p className="mt-2 text-xs text-stone-600">{getConfidenceExplanation(result)}</p>
+                  </div>
+
+                  {/* Details accordion (A.2) */}
+                  <Accordion title="Details">
+                    <div className="space-y-3 text-sm text-stone-700">
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <div className="text-xs text-stone-500 mb-1">Borough</div>
+                          <div className="font-medium">{result.borough}</div>
+                        </div>
+                        <div>
+                          <div className="text-xs text-stone-500 mb-1">Listed price</div>
+                          <div className="font-medium">£{Math.round(result.listed_price_pcm).toLocaleString()}/month</div>
+                        </div>
+                        {result.nearest_station_distance_m > 0 && (
+                          <div>
+                            <div className="text-xs text-stone-500 mb-1">Nearest station</div>
+                            <div className="font-medium">{Math.round(result.nearest_station_distance_m)}m</div>
+                          </div>
+                        )}
+                        {result.transport_adjustment_pct !== 0 && (
+                          <div>
+                            <div className="text-xs text-stone-500 mb-1">Transport adjustment</div>
+                            <div className="font-medium">{result.transport_adjustment_pct > 0 ? '+' : ''}{Number((result.transport_adjustment_pct ?? 0) * 100).toFixed(1)}%</div>
+                          </div>
+                        )}
+                        {result.comps_used && (
+                          <>
+                            <div>
+                              <div className="text-xs text-stone-500 mb-1">Nearby rentals used</div>
+                              <div className="font-medium">{result.comps_sample_size} properties</div>
+                            </div>
+                            <div>
+                              <div className="text-xs text-stone-500 mb-1">Search radius</div>
+                              <div className="font-medium">{Math.round(result.comps_radius_m)}m</div>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                      <div className="pt-3 border-t border-stone-200">
+                        <div className="text-xs text-stone-500 mb-2">Full explanation</div>
+                        <ul className="space-y-1 text-xs text-stone-600">
+                          {result.explanations.map((explanation, idx) => (
+                            <li key={idx} className="flex items-start gap-2">
+                              <span className="text-stone-400 mt-0.5">•</span>
+                              <span>{explanation}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
                   </Accordion>
 
-                  <Accordion title="FOR TESTING">
-                    <DebugPanel result={result} fmt={fmt} fmtInt={fmtInt} assetAnalysis={assetAnalysis} />
-                  </Accordion>
+                  {/* Developer mode panel (A.6) */}
+                  {developerMode && (
+                    <Accordion title="Developer mode">
+                      <div className="space-y-4">
+                        <div className="flex items-center gap-2">
+                          <label className="flex items-center gap-2 text-sm text-stone-700 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={formData.save_as_comparable ?? true}
+                              onChange={(e) => setFormData({ ...formData, save_as_comparable: e.target.checked })}
+                              className="rounded border-stone-300 text-emerald-700 focus:ring-emerald-500"
+                            />
+                            <span>Save this evaluation as a comparable</span>
+                          </label>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <label className="flex items-center gap-2 text-sm text-stone-700 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={debugParse}
+                              onChange={(e) => setDebugParse(e.target.checked)}
+                              className="rounded border-stone-300 text-emerald-700 focus:ring-emerald-500"
+                            />
+                            <span>Debug parse</span>
+                          </label>
+                        </div>
+                        <DebugPanel result={result} fmt={fmt} fmtInt={fmtInt} assetAnalysis={assetAnalysis} />
+                      </div>
+                    </Accordion>
+                  )}
                 </div>
               )}
             </GlassCard>
           </div>
         </div>
 
-        <div className="mt-10 text-center text-xs text-zinc-500">
+        <div className="mt-10 text-center text-xs text-stone-500">
           Built for skill-building. Always verify listings manually.
         </div>
       </div>
@@ -865,11 +1128,11 @@ export default function Home() {
 
 // Helper Components
 
-const inputClass = "w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-zinc-100 placeholder:text-zinc-500 outline-none focus:ring-2 focus:ring-indigo-500/40"
+const inputClass = "w-full rounded-lg border border-stone-200 bg-white px-4 py-3 text-sm text-stone-900 placeholder:text-stone-400 outline-none focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 transition-colors"
 
 function GlassCard({ children, className = '' }: { children: React.ReactNode; className?: string }) {
   return (
-    <div className={`rounded-2xl border border-white/10 bg-white/5 backdrop-blur-xl p-6 shadow-xl ${className}`}>
+    <div className={`rounded-xl border border-stone-200 bg-white p-6 shadow-sm ${className}`}>
       {children}
     </div>
   )
@@ -880,9 +1143,9 @@ function SectionTitle({ icon, title, subtitle }: { icon: React.ReactNode; title:
     <div>
       <div className="flex items-center gap-2">
         {icon}
-        <h2 className="text-lg font-semibold text-zinc-100">{title}</h2>
+        <h2 className="text-lg font-semibold text-stone-900">{title}</h2>
       </div>
-      {subtitle && <p className="mt-1 text-xs text-zinc-400">{subtitle}</p>}
+      {subtitle && <p className="mt-1 text-xs text-stone-600">{subtitle}</p>}
     </div>
   )
 }
@@ -890,7 +1153,7 @@ function SectionTitle({ icon, title, subtitle }: { icon: React.ReactNode; title:
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
-      <label className="block text-xs text-zinc-300 mb-2">{label}</label>
+      <label className="block text-xs text-stone-600 font-medium mb-2">{label}</label>
       {children}
     </div>
   )
@@ -898,11 +1161,11 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 function MiniStat({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
   return (
-    <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-zinc-950/30 p-2">
-      <div className="text-zinc-400">{icon}</div>
+    <div className="flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 p-2">
+      <div className="text-stone-400">{icon}</div>
       <div className="flex-1">
-        <div className="text-[10px] text-zinc-400">{label}</div>
-        <div className="text-xs font-medium text-zinc-100">{value}</div>
+        <div className="text-[10px] text-stone-500">{label}</div>
+        <div className="text-xs font-medium text-stone-900">{value}</div>
       </div>
     </div>
   )
@@ -910,13 +1173,13 @@ function MiniStat({ icon, label, value }: { icon: React.ReactNode; label: string
 
 function StatBadge({ label, tone }: { label: string; tone: "good" | "warn" | "bad" | "neutral" }) {
   const toneStyles = {
-    good: "bg-emerald-500/20 text-emerald-300 border-emerald-500/30",
-    warn: "bg-amber-500/20 text-amber-300 border-amber-500/30",
-    bad: "bg-red-500/20 text-red-300 border-red-500/30",
-    neutral: "bg-zinc-500/20 text-zinc-300 border-zinc-500/30",
+    good: "bg-emerald-50 text-emerald-800 border-emerald-200",
+    warn: "bg-amber-50 text-amber-800 border-amber-200",
+    bad: "bg-rose-50 text-rose-800 border-rose-200",
+    neutral: "bg-stone-100 text-stone-800 border-stone-200",
   }
   return (
-    <span className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium ${toneStyles[tone]}`}>
+    <span className={`inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold ${toneStyles[tone]}`}>
       {label}
     </span>
   )
@@ -925,14 +1188,14 @@ function StatBadge({ label, tone }: { label: string; tone: "good" | "warn" | "ba
 function Accordion({ title, children }: { title: string; children: React.ReactNode }) {
   const [isOpen, setIsOpen] = useState(false)
   return (
-    <div className="rounded-xl border border-white/10 bg-white/5 overflow-hidden">
+    <div className="rounded-lg border border-stone-200 bg-white overflow-hidden shadow-sm">
       <button
         onClick={() => setIsOpen(!isOpen)}
-        className="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-zinc-100 hover:bg-white/5 transition-colors"
+        className="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-stone-900 hover:bg-stone-50 transition-colors"
         aria-expanded={isOpen}
       >
         <span>{title}</span>
-        <ChevronDown className={`h-4 w-4 text-zinc-400 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+        <ChevronDown className={`h-4 w-4 text-stone-400 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
       </button>
       <AnimatePresence>
         {isOpen && (
@@ -943,7 +1206,7 @@ function Accordion({ title, children }: { title: string; children: React.ReactNo
             transition={{ duration: 0.3 }}
             className="overflow-hidden"
           >
-            <div className="px-4 pb-4 pt-2 border-t border-white/10">
+            <div className="px-4 pb-4 pt-2 border-t border-stone-200">
               {children}
             </div>
           </motion.div>
@@ -955,9 +1218,9 @@ function Accordion({ title, children }: { title: string; children: React.ReactNo
 
 function CodeStat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-xl border border-white/10 bg-zinc-950/30 p-3">
-      <div className="text-xs text-zinc-400 font-mono">{label}</div>
-      <div className="mt-1 text-sm text-zinc-100 font-mono font-semibold">{value}</div>
+    <div className="rounded-lg border border-stone-200 bg-stone-50 p-3">
+      <div className="text-xs text-stone-500 font-mono">{label}</div>
+      <div className="mt-1 text-sm text-stone-900 font-mono font-semibold">{value}</div>
     </div>
   )
 }
